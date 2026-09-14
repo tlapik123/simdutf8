@@ -1,8 +1,10 @@
 //! An UTF-8 validation implemented using a DFA.
-//! Hoewver rather than interpreting the DFA conventionally, the input is converted to
+//! However rather than interpreting the DFA conventionally, the input is converted to
 //! State->State transitions which can then be reduced associatively.
 
 use core::{arch::x86_64::*, mem::transmute};
+
+use crate::shift_dfa::{ByteClass, CLASS_LUT, ForwardDfa, ROR_CLASS_LUT, dfa_ror_offset};
 
 static C_LUT: [u8; 128] = [
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -11,7 +13,9 @@ static C_LUT: [u8; 128] = [
     6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 7, 9, 10, 10, 10, 11, 12, 12, 12, 12, 12, 12, 12,
     12, 12, 12, 12,
 ];
-static T_LUT: [u64; 16] = [
+
+/// Full transition LUT
+pub static T_LUT: [u64; 16] = [
     0x06_06_06_06_06_06_00,
     0x06_06_06_04_04_02_01,
     0x06_06_06_05_05_02_01,
@@ -33,7 +37,7 @@ static T_LUT: [u64; 16] = [
 /// # Safety
 /// Lul no :kekwyou:
 #[unsafe(no_mangle)]
-pub fn check_utf8(data: &[u8]) -> bool {
+pub fn check_utf8_avx(data: &[u8]) -> bool {
     unsafe {
         let c_lut1 = _mm512_loadu_epi8(&C_LUT[0] as *const u8 as *const i8);
         let c_lut2 = _mm512_loadu_epi8(&C_LUT[64] as *const u8 as *const i8);
@@ -41,15 +45,15 @@ pub fn check_utf8(data: &[u8]) -> bool {
         let t_lut2 = _mm512_loadu_epi64(&T_LUT[8] as *const u64 as *const i64);
         let s_lut1 = _mm512_slli_epi64(t_lut1, 3);
         let s_lut2 = _mm512_slli_epi64(t_lut2, 3);
-        let shuffle_offset = _mm512_maskz_set1_epi32(_cvtu32_mask16(0xcccc), 0x08080808);
+        let _shuffle_offset = _mm512_maskz_set1_epi32(_cvtu32_mask16(0xcccc), 0x08080808);
 
         #[rustfmt::skip]
         let process_chunk = |chunk: &[u8; 64]| {
             let chunk = _mm512_loadu_epi8(chunk.as_ptr() as *const i8);
             let mask = _mm512_movepi8_mask(chunk);
-            if mask == 0 {
-                _mm512_set1_epi64(T_LUT[0] as i64)
-            } else {
+            // if mask == 0 {
+            //     _mm512_set1_epi64(T_LUT[0] as i64)
+            // } else {
                 // let classes = _mm512_maskz_permutex2var_epi8(mask, c_lut1, chunk, c_lut2);
                 // let transitions_0 = _mm512_permutex2var_epi64(t_lut1, classes, t_lut2);
                 // let transitions_1 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 8), t_lut2);
@@ -83,34 +87,34 @@ pub fn check_utf8(data: &[u8]) -> bool {
                 let transitions_4567 = _mm512_multishift_epi64_epi8(transitions_67, transitions_45);
                 let transitions_01234567 =_mm512_multishift_epi64_epi8(transitions_4567, transitions_0123);
                 _mm512_srli_epi64(transitions_01234567, 3)
-            }
+            // }
         };
 
         // NOTE: Merging can be done using 2 shuffles to perform a horizontal reduction in each
         // vector separately and then a permute to join them together. This should result in lower
         // latency on most CPUs, but likely worse throughput.
         let merge_shuffle = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
-        // let merge_mask = _mm512_set_epi64(
-        //     0x7070707070707070u64 as i64,
-        //     0x6060606060606060u64 as i64,
-        //     0x5050505050505050u64 as i64,
-        //     0x4040404040404040u64 as i64,
-        //     0x3030303030303030u64 as i64,
-        //     0x2020202020202020u64 as i64,
-        //     0x1010101010101010u64 as i64,
-        //     0x0000000000000000u64 as i64,
-        // );
-        // let merge_adjecent = |a: __m512i, b: __m512i| {
-        //     let idx = _mm512_permutex2var_epi64(a, merge_shuffle, b);
-        //     let idx = _mm512_or_epi64(idx, merge_mask);
-        //     _mm512_permutex2var_epi8(a, idx, b)
-        // };
-
+        let merge_mask = _mm512_set_epi64(
+            0x7070707070707070u64 as i64,
+            0x6060606060606060u64 as i64,
+            0x5050505050505050u64 as i64,
+            0x4040404040404040u64 as i64,
+            0x3030303030303030u64 as i64,
+            0x2020202020202020u64 as i64,
+            0x1010101010101010u64 as i64,
+            0x0000000000000000u64 as i64,
+        );
         let merge_adjecent = |a: __m512i, b: __m512i| {
-            let a = _mm512_shuffle_epi8(a, a);
-            let b = _mm512_shuffle_epi8(b, b);
-            _mm512_permutex2var_epi64(a, merge_shuffle, b)
+            let idx = _mm512_permutex2var_epi64(a, merge_shuffle, b);
+            let idx = _mm512_or_epi64(idx, merge_mask);
+            _mm512_permutex2var_epi8(a, idx, b)
         };
+
+        // let merge_adjecent = |a: __m512i, b: __m512i| {
+        //     let a = _mm512_shuffle_epi8(a, a);
+        //     let b = _mm512_shuffle_epi8(b, b);
+        //     _mm512_permutex2var_epi64(a, merge_shuffle, b)
+        // };
 
         let (bulk, remainder) = data.as_chunks::<64>();
         let transition = bulk
@@ -138,6 +142,106 @@ pub fn check_utf8(data: &[u8]) -> bool {
             .fold(0, |acc, s| s.to_le_bytes()[acc as usize])
             == 0
     }
+}
+
+/// 16 Parallel shift automata
+#[unsafe(no_mangle)]
+pub fn parallel_automata(data: &[u8]) -> bool {
+    dbg!(data.len());
+    let mut state;
+    let rest;
+    if data.len() < 68 {
+        state = dfa_ror_offset(ForwardDfa::Ok);
+        rest = data;
+    } else {
+        if let Some(byte) = data.first() {
+            if byte >> 6 == 2 {
+                // an UTF8 string cannot start with a continuation byte
+                return false;
+            }
+        } else {
+            // Empty string is valid string
+            return true;
+        }
+
+        let mut bulk_len = (data.len() & 0xffffffffffffffc0) + 4;
+        if bulk_len > data.len() {
+            bulk_len -= 64;
+        }
+        rest = &data[bulk_len..];
+        state = unsafe {
+            // TODO: the byte classes should be arranged to make testing sync byte trivial
+            let c_lut1 = _mm512_loadu_epi8(&CLASS_LUT[128] as *const u8 as *const i8);
+            let c_lut2 = _mm512_loadu_epi8(&CLASS_LUT[192] as *const u8 as *const i8);
+            let t_lut = _mm512_loadu_epi32(ROR_CLASS_LUT.as_ptr() as *const i32);
+            let mut states = _mm512_set1_epi32(dfa_ror_offset(ForwardDfa::Ok) as i32);
+
+            let chunk_size = bulk_len >> 6;
+            let mut indexes =
+                _mm512_set_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            // let mut indexes =
+            //     _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+            indexes = _mm512_mullo_epi32(indexes, _mm512_set1_epi32(chunk_size as i32));
+
+            let words = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+            let ascii = _mm512_movepi8_mask(words);
+            let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2);
+            let sync_bytes =
+                _mm512_cmple_epi8_mask(classes, _mm512_set1_epi8(ByteClass::Four3 as i8));
+            let sb0 = _pext_u64(sync_bytes, 0x1111111111111111);
+            let sb1 = _pext_u64(sync_bytes, 0x2222222222222222) | sb0;
+            let sb2 = _pext_u64(sync_bytes, 0x4444444444444444) | sb1;
+            let sb3 = _pext_u64(sync_bytes, 0x8888888888888888) | sb2;
+            let transitions = _mm512_permutexvar_epi32(classes, t_lut);
+            states = _mm512_mask_rorv_epi32(states, sb0 as u16, transitions, states);
+            let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
+            states = _mm512_mask_rorv_epi32(states, sb1 as u16, transitions, states);
+            let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 16), t_lut);
+            states = _mm512_mask_rorv_epi32(states, sb2 as u16, transitions, states);
+            let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
+            states = _mm512_mask_rorv_epi32(states, sb3 as u16, transitions, states);
+            for _ in 1..chunk_size {
+                indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+                let words = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+                let ascii = _mm512_movepi8_mask(words);
+                let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2);
+                let transitions = _mm512_permutexvar_epi32(classes, t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 16), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+            }
+            indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+            let words = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+            let ascii = _mm512_movepi8_mask(words);
+            let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2);
+            let transitions = _mm512_permutexvar_epi32(classes, t_lut);
+            states = _mm512_mask_rorv_epi32(states, !(sb0 << 1) as u16, transitions, states);
+            let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
+            states = _mm512_mask_rorv_epi32(states, !(sb1 << 1) as u16, transitions, states);
+            let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 16), t_lut);
+            states = _mm512_mask_rorv_epi32(states, !(sb2 << 1) as u16, transitions, states);
+            let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
+            states = _mm512_mask_rorv_epi32(states, !(sb3 << 1) as u16, transitions, states);
+
+            let accepting = _mm512_cmpeq_epi32_mask(
+                _mm512_and_epi32(states, _mm512_set1_epi32(0x1f)),
+                _mm512_set1_epi32(dfa_ror_offset(ForwardDfa::Ok) as i32),
+            );
+            if accepting != 0xffff && accepting != 0xfffe {
+                return false;
+            }
+            _mm_extract_epi32::<0>(_mm512_castsi512_si128(states)) as u32 // extract the state of the last automaton, this is the one we should run until end of string.
+        }
+    }
+
+    for byte in rest {
+        state = ROR_CLASS_LUT[CLASS_LUT[*byte as usize] as usize].rotate_right(state);
+    }
+    (state & 0x1f) == dfa_ror_offset(ForwardDfa::Ok)
 }
 
 #[cfg(test)]
@@ -343,7 +447,8 @@ mod tests {
 ".as_bytes();
         for len in 0..data.len() {
             let input = &data[0..len];
-            let avx = check_utf8(input);
+            let avx = parallel_automata(input);
+            // let avx = check_utf8_avx(input);
             assert_eq!(avx, str::from_utf8(input).is_ok());
         }
     }

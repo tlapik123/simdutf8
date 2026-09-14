@@ -8,7 +8,7 @@
 )]
 #![allow(clippy::redundant_pub_crate)] // check is broken (see e.g. https://github.com/rust-lang/rust-clippy/issues/5369)
 #![allow(clippy::missing_const_for_fn)] // not necessary most of the times
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(
@@ -140,3 +140,4 @@ pub mod avx512_dfa;
 pub mod basic;
 pub mod compat;
 mod implementation;
+pub mod shift_dfa;

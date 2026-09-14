@@ -1,7 +1,10 @@
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, measurement::Measurement};
-use simdutf8::avx512_dfa::check_utf8 as avx512_dfa_utf8;
+use simdutf8::avx512_dfa::check_utf8_avx as avx512_dfa_utf8;
+use simdutf8::avx512_dfa::parallel_automata;
 use simdutf8::basic::from_utf8 as basic_from_utf8;
 use simdutf8::compat::from_utf8 as compat_from_utf8;
+use simdutf8::shift_dfa::check_utf8_shift as shift_dfa_utf8;
+use simdutf8::shift_dfa::check_utf8_shift_chunked as shift_dfa_utf8_chunk;
 
 use std::str::from_utf8 as std_from_utf8;
 
@@ -31,7 +34,10 @@ pub enum BenchFn {
     BasicNoInline,
     Compat,
     Std,
+    ShiftDfa,
+    ShiftDfaChunk,
     Avx512Dfa,
+    ParallelShifter,
 
     #[cfg(feature = "simdjson")]
     Simdjson,
@@ -203,12 +209,39 @@ fn bench_input<M: Measurement>(
                 },
             );
         }
+        BenchFn::ShiftDfa => {
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{:06}", input.len())),
+                &input,
+                |b, &slice| {
+                    b.iter(|| assert_eq!(shift_dfa_utf8(slice), expected_ok));
+                },
+            );
+        }
+        BenchFn::ShiftDfaChunk => {
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{:06}", input.len())),
+                &input,
+                |b, &slice| {
+                    b.iter(|| assert_eq!(shift_dfa_utf8_chunk(slice), expected_ok));
+                },
+            );
+        }
         BenchFn::Avx512Dfa => {
             group.bench_with_input(
                 BenchmarkId::from_parameter(format!("{:06}", input.len())),
                 &input,
                 |b, &slice| {
                     b.iter(|| assert_eq!(avx512_dfa_utf8(slice), expected_ok));
+                },
+            );
+        }
+        BenchFn::ParallelShifter => {
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{:06}", input.len())),
+                &input,
+                |b, &slice| {
+                    b.iter(|| assert_eq!(parallel_automata(slice), expected_ok));
                 },
             );
         }

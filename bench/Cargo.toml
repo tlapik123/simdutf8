@@ -52,7 +52,19 @@ name = "throughput_std"
 harness = false
 
 [[bench]]
+name = "throughput_shift_dfa"
+harness = false
+
+[[bench]]
+name = "throughput_shift_dfa_chunked"
+harness = false
+
+[[bench]]
 name = "throughput_avx512_dfa"
+harness = false
+
+[[bench]]
+name = "throughput_parallel_shifter"
 harness = false
 
 [[bench]]
