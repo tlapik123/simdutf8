@@ -3,8 +3,9 @@
 //! State->State transitions which can then be reduced associatively.
 
 use core::{arch::x86_64::*, mem::transmute};
+use std::ops::{Add, AddAssign};
 
-use crate::shift_dfa::{ByteClass, CLASS_LUT, ForwardDfa, ROR_CLASS_LUT, dfa_ror_offset};
+use crate::shift_dfa::{dfa_ror_offset, ByteClass, ForwardDfa, CLASS_LUT, ROR_CLASS_LUT};
 
 static C_LUT: [u8; 128] = [
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -144,10 +145,41 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct i32x16(__m512i);
+impl i32x16 {
+    fn gather<const N: i32>(self, base: *const i32) -> Self {
+        unsafe { Self(_mm512_i32gather_epi32::<N>(self.0, base)) }
+    }
+}
+impl Add for i32x16 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        unsafe { Self(_mm512_add_epi32(self.0, rhs.0)) }
+    }
+}
+impl Add<i32> for i32x16 {
+    type Output = Self;
+    fn add(self, rhs: i32) -> Self::Output {
+        unsafe { Self(_mm512_add_epi32(self.0, _mm512_set1_epi32(rhs))) }
+    }
+}
+impl AddAssign for i32x16 {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+impl AddAssign<i32> for i32x16 {
+    fn add_assign(&mut self, rhs: i32) {
+        *self = *self + rhs
+    }
+}
+
 /// 16 Parallel shift automata
 #[unsafe(no_mangle)]
 pub fn parallel_automata(data: &[u8]) -> bool {
-    dbg!(data.len());
+    // dbg!(data.len());
     let mut state;
     let rest;
     if data.len() < 68 {
@@ -183,9 +215,13 @@ pub fn parallel_automata(data: &[u8]) -> bool {
             //     _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
             indexes = _mm512_mullo_epi32(indexes, _mm512_set1_epi32(chunk_size as i32));
 
-            let words = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
-            let ascii = _mm512_movepi8_mask(words);
-            let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2);
+            let mut words1 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+            indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+            let mut words2 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+            indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+
+            let ascii = _mm512_movepi8_mask(words1);
+            let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words1, c_lut2);
             let sync_bytes =
                 _mm512_cmple_epi8_mask(classes, _mm512_set1_epi8(ByteClass::Four3 as i8));
             let sb0 = _pext_u64(sync_bytes, 0x1111111111111111);
@@ -200,11 +236,29 @@ pub fn parallel_automata(data: &[u8]) -> bool {
             states = _mm512_mask_rorv_epi32(states, sb2 as u16, transitions, states);
             let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
             states = _mm512_mask_rorv_epi32(states, sb3 as u16, transitions, states);
-            for _ in 1..chunk_size {
+
+            // words1 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+            // indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+            for _ in 1..(chunk_size + 1) / 2 {
+                // for _ in 1..chunk_size {
+                let ascii = _mm512_movepi8_mask(words2);
+                let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words2, c_lut2);
+                let transitions = _mm512_permutexvar_epi32(classes, t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 16), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+
+                words1 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
                 indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
-                let words = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
-                let ascii = _mm512_movepi8_mask(words);
-                let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2);
+                words2 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+                indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+
+                let ascii = _mm512_movepi8_mask(words1);
+                let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words1, c_lut2);
                 let transitions = _mm512_permutexvar_epi32(classes, t_lut);
                 states = _mm512_rorv_epi32(transitions, states);
                 let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
@@ -214,10 +268,24 @@ pub fn parallel_automata(data: &[u8]) -> bool {
                 let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
                 states = _mm512_rorv_epi32(transitions, states);
             }
-            indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
-            let words = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
-            let ascii = _mm512_movepi8_mask(words);
-            let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2);
+            if chunk_size % 2 == 0 && chunk_size > 0 {
+                let ascii = _mm512_movepi8_mask(words2);
+                let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words2, c_lut2);
+                let transitions = _mm512_permutexvar_epi32(classes, t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 16), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+                let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 24), t_lut);
+                states = _mm512_rorv_epi32(transitions, states);
+
+                words2 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+                indexes = _mm512_add_epi32(indexes, _mm512_set1_epi32(1));
+            }
+            // words1 = _mm512_i32gather_epi32::<4>(indexes, data.as_ptr() as *const i32);
+            let ascii = _mm512_movepi8_mask(words2);
+            let classes = _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words2, c_lut2);
             let transitions = _mm512_permutexvar_epi32(classes, t_lut);
             states = _mm512_mask_rorv_epi32(states, !(sb0 << 1) as u16, transitions, states);
             let transitions = _mm512_permutevar_epi32(_mm512_srli_epi32(classes, 8), t_lut);
