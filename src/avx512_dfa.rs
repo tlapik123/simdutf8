@@ -208,32 +208,31 @@ impl AddAssign<i32> for i32x16 {
     }
 }
 
-/// Transpose 16 rows of 16 dwords: `r[k]` becomes dword `k` of every input row (lane j = row j).
+/// Transpose 16 rows of 8 dwords, given as `r[j]` = rows j (low half) and j+8 (high half):
+/// `r[k]` becomes dword `k` of every input row (lane j = row j).
 #[inline(always)]
-unsafe fn transpose16(r: &mut [__m512i; 16]) {
-    let mut t: [__m512i; 16] = [_mm512_setzero_si512(); 16];
-    for p in 0..8 {
+unsafe fn transpose8(r: &mut [__m512i; 8]) {
+    let mut t: [__m512i; 8] = [_mm512_setzero_si512(); 8];
+    for p in 0..4 {
         t[2 * p] = _mm512_unpacklo_epi32(r[2 * p], r[2 * p + 1]);
         t[2 * p + 1] = _mm512_unpackhi_epi32(r[2 * p], r[2 * p + 1]);
     }
-    for q in 0..4 {
+    for q in 0..2 {
         let b = 4 * q;
         r[b] = _mm512_unpacklo_epi64(t[b], t[b + 2]);
         r[b + 1] = _mm512_unpackhi_epi64(t[b], t[b + 2]);
         r[b + 2] = _mm512_unpacklo_epi64(t[b + 1], t[b + 3]);
         r[b + 3] = _mm512_unpackhi_epi64(t[b + 1], t[b + 3]);
     }
-    for h in 0..2 {
-        let b = 8 * h;
-        for k in 0..4 {
-            t[b + k] = _mm512_shuffle_i32x4::<0x88>(r[b + k], r[b + 4 + k]);
-            t[b + 4 + k] = _mm512_shuffle_i32x4::<0xdd>(r[b + k], r[b + 4 + k]);
-        }
+    // Now 128-bit block b of r[k] (k < 4) holds dword k (b even) or k+4 (b odd) of rows
+    // 8(b/2)..+4, and r[k+4] the same for rows 4+8(b/2)..: interleave their blocks.
+    let lo = _mm512_set_epi64(13, 12, 5, 4, 9, 8, 1, 0);
+    let hi = _mm512_set_epi64(15, 14, 7, 6, 11, 10, 3, 2);
+    for k in 0..4 {
+        t[k] = _mm512_permutex2var_epi64(r[k], lo, r[k + 4]);
+        t[k + 4] = _mm512_permutex2var_epi64(r[k], hi, r[k + 4]);
     }
-    for k in 0..8 {
-        r[k] = _mm512_shuffle_i32x4::<0x88>(t[k], t[8 + k]);
-        r[8 + k] = _mm512_shuffle_i32x4::<0xdd>(t[k], t[8 + k]);
-    }
+    *r = t;
 }
 
 /// Number of state vectors (16 shift automata each) run in parallel.
@@ -342,14 +341,23 @@ pub fn parallel_automata(data: &[u8]) -> bool {
                 states[v] = masked_step(states[v], words, sb[v].map(|m| m as u16));
             }
 
-            // Blocks of 16 dwords per region: 16 vector loads + an in-register 16x16 dword
-            // transpose per vector instead of scalar gathers.
-            let load_rows = |v: usize, i: usize| -> [__m512i; 16] {
-                array::from_fn(|j| _mm512_loadu_epi32(base.add(starts[lane_region(v, j)] + i)))
+            // Blocks of 8 dwords per region: 8 dwords of regions j and j+8 share one vector
+            // (16 ymm loads) and a 16x8 in-register transpose yields 8 words vectors. 8 words
+            // per state vector keep all V blocks in registers, so the V dependency chains
+            // interleave step by step.
+            let load_rows = |v: usize, i: usize| -> [__m512i; 8] {
+                array::from_fn(|j| {
+                    let lo = base.add(starts[lane_region(v, j)] + i) as *const __m256i;
+                    let hi = base.add(starts[lane_region(v, j + 8)] + i) as *const __m256i;
+                    _mm512_inserti64x4::<1>(
+                        _mm512_castsi256_si512(_mm256_loadu_si256(lo)),
+                        _mm256_loadu_si256(hi),
+                    )
+                })
             };
             let load_block = |v: usize, i: usize| {
                 let mut r = load_rows(v, i);
-                transpose16(&mut r);
+                transpose8(&mut r);
                 r
             };
             let all_ok = |states: __m512i| {
@@ -357,33 +365,35 @@ pub fn parallel_automata(data: &[u8]) -> bool {
                     == 0xffff
             };
             let mut i = 1;
-            while i + 16 <= vector_len(0) {
-                // One vector's block at a time: its 16 transposed words stay in registers
-                // (two blocks at once spilled to the stack).
-                for v in 0..V {
-                    let mut rows = load_rows(v, i);
-                    // An all-ASCII block keeps every automaton that is in the Ok state in Ok.
-                    let any = rows
-                        .iter()
-                        .fold(_mm512_setzero_si512(), |a, b| _mm512_or_epi64(a, *b));
-                    if _mm512_movepi8_mask(any) == 0 && all_ok(states[v]) {
-                        continue;
-                    }
-                    transpose16(&mut rows);
-                    for words in rows {
-                        states[v] = step(states[v], words);
+            while i + 8 <= vector_len(0) {
+                let mut rows: [[__m512i; 8]; V] = array::from_fn(|v| load_rows(v, i));
+                // An all-ASCII block keeps every automaton that is in the Ok state in Ok.
+                let any = rows
+                    .iter()
+                    .flatten()
+                    .fold(_mm512_setzero_si512(), |a, b| _mm512_or_epi64(a, *b));
+                if _mm512_movepi8_mask(any) == 0 && states.iter().all(|s| all_ok(*s)) {
+                    i += 8;
+                    continue;
+                }
+                for r in &mut rows {
+                    transpose8(r);
+                }
+                for k in 0..8 {
+                    for v in 0..V {
+                        states[v] = step(states[v], rows[v][k]);
                     }
                 }
-                i += 16;
+                i += 8;
             }
             // Vector 0 has the shortest regions; the others finish on their own.
             for v in 0..V {
                 let mut iv = i;
-                while iv + 16 <= vector_len(v) {
+                while iv + 8 <= vector_len(v) {
                     for words in load_block(v, iv) {
                         states[v] = step(states[v], words);
                     }
-                    iv += 16;
+                    iv += 8;
                 }
                 while iv < vector_len(v) {
                     states[v] = step(states[v], gather(v, iv));
