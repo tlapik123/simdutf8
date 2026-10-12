@@ -358,23 +358,20 @@ pub fn parallel_automata(data: &[u8]) -> bool {
             };
             let mut i = 1;
             while i + 16 <= vector_len(0) {
-                let mut rows: [[__m512i; 16]; V] = array::from_fn(|v| load_rows(v, i));
-                // An all-ASCII block keeps every automaton that is in the Ok state in Ok.
-                let any = rows
-                    .iter()
-                    .flatten()
-                    .fold(_mm512_setzero_si512(), |a, b| _mm512_or_epi64(a, *b));
-                if _mm512_movepi8_mask(any) == 0 && states.iter().all(|s| all_ok(*s)) {
-                    i += 16;
-                    continue;
-                }
-                for r in &mut rows {
-                    transpose16(r);
-                }
-                let words = rows;
-                for k in 0..16 {
-                    for v in 0..V {
-                        states[v] = step(states[v], words[v][k]);
+                // One vector's block at a time: its 16 transposed words stay in registers
+                // (two blocks at once spilled to the stack).
+                for v in 0..V {
+                    let mut rows = load_rows(v, i);
+                    // An all-ASCII block keeps every automaton that is in the Ok state in Ok.
+                    let any = rows
+                        .iter()
+                        .fold(_mm512_setzero_si512(), |a, b| _mm512_or_epi64(a, *b));
+                    if _mm512_movepi8_mask(any) == 0 && all_ok(states[v]) {
+                        continue;
+                    }
+                    transpose16(&mut rows);
+                    for words in rows {
+                        states[v] = step(states[v], words);
                     }
                 }
                 i += 16;
