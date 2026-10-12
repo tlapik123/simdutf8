@@ -125,14 +125,20 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
         // idempotent, so a run of ASCII chunks only needs to be merged once.
         let ascii_transition = _mm512_set1_epi64(T_LUT[0] as i64);
         let mut transition = _mm512_set1_epi64(0x0706050403020100);
-        let (blocks, chunks) = bulk.as_chunks::<4>();
+        let (blocks, chunks) = bulk.as_chunks::<8>();
         let mut prev_ascii = false;
         for block in blocks {
-            let c0 = load(&block[0]);
-            let c1 = load(&block[1]);
-            let c2 = load(&block[2]);
-            let c3 = load(&block[3]);
-            let any = _mm512_or_epi64(_mm512_or_epi64(c0, c1), _mm512_or_epi64(c2, c3));
+            let c: [__m512i; 8] = array::from_fn(|k| load(&block[k]));
+            // Tree-shaped OR: short dependency chain for the (common) all-ASCII case.
+            let mut any = c;
+            let mut n = any.len();
+            while n > 1 {
+                n /= 2;
+                for k in 0..n {
+                    any[k] = _mm512_or_epi64(any[k], any[k + n]);
+                }
+            }
+            let any = any[0];
             if _mm512_movepi8_mask(any) == 0 {
                 if !prev_ascii {
                     transition = merge_adjecent(transition, ascii_transition);
@@ -141,9 +147,11 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
                 continue;
             }
             prev_ascii = false;
-            // Tree-merge the block first so the loop-carried chain is one merge per 256 bytes.
-            let t01 = merge_adjecent(process_chunk(c0), process_chunk(c1));
-            let t23 = merge_adjecent(process_chunk(c2), process_chunk(c3));
+            // Tree-merge the block first so the loop-carried chain is one merge per 512 bytes.
+            let t: [__m512i; 4] =
+                array::from_fn(|k| merge_adjecent(process_chunk(c[2 * k]), process_chunk(c[2 * k + 1])));
+            let t01 = merge_adjecent(t[0], t[1]);
+            let t23 = merge_adjecent(t[2], t[3]);
             transition = merge_adjecent(transition, merge_adjecent(t01, t23));
         }
         for chunk in chunks {
