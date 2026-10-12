@@ -247,11 +247,16 @@ pub fn parallel_automata(data: &[u8]) -> bool {
     // The regions of each state vector have a different length (chunk_size + delta, delta a
     // multiple of a cache line) so that the concurrently accessed lines of the regions do not
     // all alias to the same L1 set when the input length is a multiple of 4 KiB.
+    // Below this the 32 short regions cost more than they gain; the associative kernel
+    // is faster there.
+    const MIN_LEN: usize = 20 * 1024;
     let mut state;
     let rest;
-    if data.len() < REGIONS * 4 + 4 {
+    if data.len() <= 16 {
         state = dfa_ror_offset(ForwardDfa::Ok);
         rest = data;
+    } else if data.len() < MIN_LEN {
+        return check_utf8_avx(data);
     } else {
         if data[0] >> 6 == 2 {
             // an UTF8 string cannot start with a continuation byte
