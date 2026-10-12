@@ -18,7 +18,6 @@
 use core::arch::x86_64::*;
 use std::array;
 
-use crate::shift_dfa::{dfa_ror_offset, ByteClass, ForwardDfa, CLASS_LUT, ROR_CLASS_LUT};
 
 /// `Fail` state of the count DFA; the others are 0 (`Ok`) and 1..3 (continuation bytes seen).
 const F: u8 = 4;
@@ -464,35 +463,27 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
     unsafe { check_utf8_kernel(data) }
 }
 
-/// Transpose 16 rows of 8 dwords, given as `r[j]` = rows j (low half) and j+8 (high half):
-/// `r[k]` becomes dword `k` of every input row (lane j = row j).
+/// In-register 8x8 transpose of 64-bit elements: `r[k]` becomes qword `k` of every input row.
 #[inline(always)]
-unsafe fn transpose8(r: &mut [__m512i; 8]) {
-    let mut t: [__m512i; 8] = [_mm512_setzero_si512(); 8];
-    for p in 0..4 {
-        t[2 * p] = _mm512_unpacklo_epi32(r[2 * p], r[2 * p + 1]);
-        t[2 * p + 1] = _mm512_unpackhi_epi32(r[2 * p], r[2 * p + 1]);
+unsafe fn transpose8x8(r: &mut [__m512i; 8]) {
+    let t: [__m512i; 8] = array::from_fn(|k| {
+        let (a, b) = (r[k & !1], r[k | 1]);
+        if k & 1 == 0 { _mm512_unpacklo_epi64(a, b) } else { _mm512_unpackhi_epi64(a, b) }
+    });
+    // 128-bit blocks (2 qwords of adjacent rows): gather blocks 0,2 resp. 1,3 of pairs.
+    let u: [__m512i; 8] = array::from_fn(|k| {
+        let (a, b) = (t[k & !2], t[k | 2]);
+        if k & 2 == 0 { _mm512_shuffle_i64x2::<0x88>(a, b) } else { _mm512_shuffle_i64x2::<0xdd>(a, b) }
+    });
+    // Stage 2 picked qwords {0,4} (0x88) or {2,6} (0xdd), stage 3 picks +0 or +4.
+    for k in 0..8 {
+        let (a, b) = (u[k & !4], u[k | 4]);
+        r[k] = if k & 4 == 0 { _mm512_shuffle_i64x2::<0x88>(a, b) } else { _mm512_shuffle_i64x2::<0xdd>(a, b) };
     }
-    for q in 0..2 {
-        let b = 4 * q;
-        r[b] = _mm512_unpacklo_epi64(t[b], t[b + 2]);
-        r[b + 1] = _mm512_unpackhi_epi64(t[b], t[b + 2]);
-        r[b + 2] = _mm512_unpacklo_epi64(t[b + 1], t[b + 3]);
-        r[b + 3] = _mm512_unpackhi_epi64(t[b + 1], t[b + 3]);
-    }
-    // Now 128-bit block b of r[k] (k < 4) holds dword k (b even) or k+4 (b odd) of rows
-    // 8(b/2)..+4, and r[k+4] the same for rows 4+8(b/2)..: interleave their blocks.
-    let lo = _mm512_set_epi64(13, 12, 5, 4, 9, 8, 1, 0);
-    let hi = _mm512_set_epi64(15, 14, 7, 6, 11, 10, 3, 2);
-    for k in 0..4 {
-        t[k] = _mm512_permutex2var_epi64(r[k], lo, r[k + 4]);
-        t[k + 4] = _mm512_permutex2var_epi64(r[k], hi, r[k + 4]);
-    }
-    *r = t;
 }
 
-/// Number of state vectors (16 shift automata each) run in parallel.
-const AUTOMATA_VECTORS: usize = 2;
+/// Number of regions (one per 64-bit lane) processed in parallel.
+const REGIONS: usize = 8;
 
 /// Length of the longest prefix of whole 256-byte blocks that is all ASCII.
 fn ascii_prefix_len(data: &[u8]) -> usize {
@@ -512,200 +503,188 @@ fn ascii_prefix_len(data: &[u8]) -> usize {
     n
 }
 
-/// 16 * AUTOMATA_VECTORS parallel shift automata
-#[unsafe(no_mangle)]
-pub fn parallel_automata(data: &[u8]) -> bool {
-    const V: usize = AUTOMATA_VECTORS;
-    // An ASCII prefix cannot affect validity. Scanning it as one sequential stream is about
-    // twice as fast as skipping it region by region (32 streams defeat the prefetchers).
-    let data = &data[ascii_prefix_len(data)..];
-    const REGIONS: usize = 16 * V;
-    // The regions of each state vector have a different length (chunk_size + delta, delta a
-    // multiple of a cache line) so that the concurrently accessed lines of the regions do not
-    // all alias to the same L1 set when the input length is a multiple of 4 KiB.
-    // Below this the 32 short regions cost more than they gain; the associative kernel
-    // is faster there.
-    const MIN_LEN: usize = 20 * 1024;
-    let mut state;
-    let rest;
-    if data.len() <= 16 {
-        state = dfa_ror_offset(ForwardDfa::Ok);
-        rest = data;
-    } else if data.len() < MIN_LEN {
-        return check_utf8_avx(data);
-    } else {
-        if data[0] >> 6 == 2 {
-            // an UTF8 string cannot start with a continuation byte
+/// Scalar continuation: `prev` is the code of the last byte seen, `needed` the number of
+/// continuation bytes still outstanding.
+fn finish_scalar(mut prev: u8, mut needed: u8, rest: &[u8]) -> bool {
+    for &x in rest {
+        let code = CODE_LUT[(x.saturating_add(1).saturating_sub(0x80)) as usize];
+        if PAIR_LUT[(prev & 0x78 | code & 7) as usize] == PAIR_FAIL {
             return false;
         }
+        needed = match (b_class(code & 7), needed) {
+            (Class::Ascii, 0) => 0,
+            (Class::Cont, n) if n > 0 => n - 1,
+            (Class::Lead2, 0) => 1,
+            (Class::Lead3, 0) => 2,
+            (Class::Lead4, 0) => 3,
+            _ => return false,
+        };
+        prev = code;
+    }
+    needed == 0
+}
 
-        let mut bulk_len = (data.len() & !(REGIONS * 4 - 1)) + 4;
-        if bulk_len > data.len() {
-            bulk_len -= REGIONS * 4;
-        }
-        rest = &data[bulk_len..];
-        state = unsafe {
-            // TODO: the byte classes should be arranged to make testing sync byte trivial
-            let c_lut1 = _mm512_loadu_epi8(&CLASS_LUT[128] as *const u8 as *const i8);
-            let c_lut2 = _mm512_loadu_epi8(&CLASS_LUT[192] as *const u8 as *const i8);
-            let t_lut = _mm512_loadu_epi32(ROR_CLASS_LUT.as_ptr() as *const i32);
-            let ok = _mm512_set1_epi32(dfa_ror_offset(ForwardDfa::Ok) as i32);
-            let mut states = [ok; V];
+/// Per-lane automaton state (lane j runs region j).
+struct Lanes {
+    /// Code bytes of the previous qword (for the pair of the qword's first byte).
+    c_prev: __m512i,
+    /// (s, v) of the previous two quads, `v | s << 4` in bytes 1 and 5 of each qword.
+    q_prev: __m512i,
+}
 
-            // Region r (0..REGIONS) is lens[r] dwords, vector v lane j runs region 16v+15-j.
-            let chunk_size = bulk_len / (REGIONS * 4);
-            let delta_unit: isize = if chunk_size >= 128 { 16 } else { 0 };
-            let vector_len = |v: usize| {
-                (chunk_size as isize + delta_unit * (2 * v as isize - (V as isize - 1))) as usize
-            };
-            let lane_region = |v: usize, j: usize| 16 * v + 15 - j;
-            let lens: [usize; REGIONS] = array::from_fn(|r| vector_len(r / 16));
-            let mut starts = [0usize; REGIONS];
-            for r in 1..REGIONS {
-                starts[r] = starts[r - 1] + lens[r - 1];
-            }
-            let base = data.as_ptr() as *const i32;
-            let classify = |words: __m512i| {
-                let ascii = _mm512_movepi8_mask(words);
-                _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2)
-            };
-            let transitions = |classes: __m512i, byte: usize| {
-                let idx = match byte {
-                    0 => classes,
-                    1 => _mm512_srli_epi32(classes, 8),
-                    2 => _mm512_srli_epi32(classes, 16),
-                    _ => _mm512_srli_epi32(classes, 24),
-                };
-                _mm512_permutexvar_epi32(idx, t_lut)
-            };
-            let step = |states: __m512i, words: __m512i| {
-                let classes = classify(words);
-                let s = _mm512_rorv_epi32(transitions(classes, 0), states);
-                let s = _mm512_rorv_epi32(transitions(classes, 1), s);
-                let s = _mm512_rorv_epi32(transitions(classes, 2), s);
-                _mm512_rorv_epi32(transitions(classes, 3), s)
-            };
-            let masked_step = |states: __m512i, words: __m512i, masks: [u16; 4]| {
-                let classes = classify(words);
-                let mut s = states;
-                for b in 0..4 {
-                    s = _mm512_mask_rorv_epi32(s, masks[b], transitions(classes, b), s);
-                }
-                s
-            };
+/// Two quads (one qword) per lane: pair lookups on all eight byte pairs and the quads'
+/// (s, v) in bytes 1 and 5; updates the code history and the pair-failure accumulator.
+#[inline(always)]
+unsafe fn quad_lookup(l: &Luts, st: &mut Scan, la: &mut Lanes, words: __m512i) -> __m512i {
+    let y = _mm512_subs_epu8(_mm512_adds_epu8(words, l.one), l.x80);
+    let code = _mm512_permutex2var_epi8(l.code.0, y, l.code.1);
+    let prev = _mm512_shldi_epi64::<8>(code, la.c_prev);
+    la.c_prev = code;
+    let key = _mm512_ternarylogic_epi32::<0xCA>(l.a_mask, prev, code);
+    let pair = _mm512_permutex2var_epi8(l.pair.0, key, l.pair.1);
+    st.pair_max = _mm512_max_epu8(st.pair_max, pair);
+    let qk = _mm512_madd_epi16(pair, l.w1);
+    lookup2_maskz(0x2222_2222_2222_2222, l.quad.0, qk, l.quad.1)
+}
 
-            // Blocks of 8 dwords per region: 8 dwords of regions j and j+8 share one vector
-            // (16 ymm loads) and a 16x8 in-register transpose yields 8 words vectors. 8 words
-            // per state vector keep all V blocks in registers, so the V dependency chains
-            // interleave step by step.
-            let load_rows = |v: usize, i: usize| -> [__m512i; 8] {
-                array::from_fn(|j| {
-                    let lo = base.add(starts[lane_region(v, j)] + i) as *const __m256i;
-                    let hi = base.add(starts[lane_region(v, j + 8)] + i) as *const __m256i;
-                    _mm512_inserti64x4::<1>(
-                        _mm512_castsi256_si512(_mm256_loadu_si256(lo)),
-                        _mm256_loadu_si256(hi),
-                    )
-                })
-            };
-            // Partial block of n <= 8 dwords (zero beyond); masked loads are slow, so only
-            // for the ends of the regions.
-            let load_block_masked = |v: usize, i: usize, n: usize| -> [__m512i; 8] {
-                let m = ((1u32 << n) - 1) as __mmask8;
-                let mut r: [__m512i; 8] = array::from_fn(|j| {
-                    let lo = _mm256_maskz_loadu_epi32(m, base.add(starts[lane_region(v, j)] + i));
-                    let hi = _mm256_maskz_loadu_epi32(m, base.add(starts[lane_region(v, j + 8)] + i));
-                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
-                });
-                transpose8(&mut r);
-                r
-            };
-            // First dword: automata only start at a sync byte (ASCII or lead byte).
-            // sb[v][b] bit j: lane j of vector v has synced before byte b.
-            let mut sb = [[0u64; 4]; V];
-            for v in 0..V {
-                let words = load_block_masked(v, 0, 1)[0];
-                let sync_bytes = _mm512_cmple_epi8_mask(
-                    classify(words),
-                    _mm512_set1_epi8(ByteClass::Four3 as i8),
-                );
-                sb[v][0] = _pext_u64(sync_bytes, 0x1111111111111111);
-                sb[v][1] = _pext_u64(sync_bytes, 0x2222222222222222) | sb[v][0];
-                sb[v][2] = _pext_u64(sync_bytes, 0x4444444444444444) | sb[v][1];
-                sb[v][3] = _pext_u64(sync_bytes, 0x8888888888888888) | sb[v][2];
-                states[v] = masked_step(states[v], words, sb[v].map(|m| m as u16));
-            }
+/// The state `s` required by a quad must be the state `v` yielded by the next one:
+/// quad 0 of this step against quad 1 of the previous step, quad 1 against quad 0.
+#[inline(always)]
+unsafe fn chain_step(st: &mut Scan, la: &mut Lanes, q: __m512i) {
+    let next = _mm512_shldi_epi64::<32>(q, la.q_prev);
+    let s = _mm512_srli_epi64::<4>(next);
+    st.chain = _mm512_ternarylogic_epi32::<0xF6>(st.chain, s, q);
+    la.q_prev = q;
+}
 
-            let all_ok = |states: __m512i| {
-                _mm512_cmpeq_epi32_mask(_mm512_and_epi32(states, _mm512_set1_epi32(0x1f)), ok)
-                    == 0xffff
-            };
-            let mut i = 1;
-            while i + 8 <= vector_len(0) {
-                let mut rows: [[__m512i; 8]; V] = array::from_fn(|v| load_rows(v, i));
-                // An all-ASCII block keeps every automaton that is in the Ok state in Ok.
-                let any = rows
-                    .iter()
-                    .flatten()
-                    .fold(_mm512_setzero_si512(), |a, b| _mm512_or_epi64(a, *b));
-                if _mm512_movepi8_mask(any) == 0 && states.iter().all(|s| all_ok(*s)) {
-                    i += 8;
-                    continue;
-                }
-                for r in &mut rows {
-                    transpose8(r);
-                }
-                for k in 0..8 {
-                    for v in 0..V {
-                        states[v] = step(states[v], rows[v][k]);
-                    }
-                }
-                i += 8;
-            }
-            // Vector 0 has the shortest regions; the others finish on their own.
-            for v in 0..V {
-                let mut iv = i;
-                while iv + 8 <= vector_len(v) {
-                    let mut rows = load_rows(v, iv);
-                    transpose8(&mut rows);
-                    for words in rows {
-                        states[v] = step(states[v], words);
-                    }
-                    iv += 8;
-                }
-                // The leftover dwords plus the first dword of the next region (contiguous).
-                let rem = vector_len(v) - iv;
-                let words = load_block_masked(v, iv, rem + 1);
-                for k in 0..rem {
-                    states[v] = step(states[v], words[k]);
-                }
-                // Each automaton runs into the next region until the point where that
-                // region's automaton synced; the very last one also consumes the 4 extra bytes.
-                let masks: [u16; 4] = array::from_fn(|b| {
-                    let next_vector_synced = if v + 1 < V { sb[v + 1][b] >> 15 } else { 0 };
-                    !((sb[v][b] << 1) | next_vector_synced) as u16
-                });
-                states[v] = masked_step(states[v], words[rem], masks);
-            }
+/// Region layout: region r starts at `row[r]`.
+struct Regions {
+    row: [*const u64; REGIONS],
+}
 
-            for v in 0..V {
-                let accepting = _mm512_cmpeq_epi32_mask(
-                    _mm512_and_epi32(states[v], _mm512_set1_epi32(0x1f)),
-                    ok,
-                );
-                // Lane 0 of the last vector continues into `rest`.
-                if accepting != 0xffff && (v + 1 < V || accepting != 0xfffe) {
-                    return false;
-                }
-            }
-            _mm_extract_epi32::<0>(_mm512_castsi512_si128(states[V - 1])) as u32
-        }
+impl Regions {
+    #[inline(always)]
+    unsafe fn load_rows(&self, i: usize) -> [__m512i; 8] {
+        array::from_fn(|j| _mm512_loadu_si512(self.row[j].add(i).cast()))
     }
 
-    for byte in rest {
-        state = ROR_CLASS_LUT[CLASS_LUT[*byte as usize] as usize].rotate_right(state);
+    /// Partial block of n <= 8 qwords per region (zero beyond), transposed.
+    #[inline(always)]
+    unsafe fn load_rows_masked(&self, i: usize, n: usize) -> [__m512i; 8] {
+        let m = ((1u32 << n) - 1) as __mmask8;
+        let mut r: [__m512i; 8] =
+            array::from_fn(|j| _mm512_maskz_loadu_epi64(m, self.row[j].add(i).cast()));
+        transpose8x8(&mut r);
+        r
     }
-    (state & 0x1f) == dfa_ror_offset(ForwardDfa::Ok)
+}
+
+/// A block of 8 qwords per lane. An all-ASCII block is valid iff no automaton needs
+/// continuation bytes, and leaves every automaton in the initial state.
+#[inline(always)]
+unsafe fn block(l: &Luts, rg: &Regions, st: &mut Scan, la: &mut Lanes, i: usize) {
+    let mut rows = rg.load_rows(i);
+    let any = _mm512_ternarylogic_epi32::<0xFE>(
+        _mm512_ternarylogic_epi32::<0xFE>(rows[0], rows[1], rows[2]),
+        _mm512_ternarylogic_epi32::<0xFE>(rows[3], rows[4], rows[5]),
+        _mm512_or_si512(rows[6], rows[7]),
+    );
+    if _mm512_movepi8_mask(any) == 0
+        && _mm512_test_epi64_mask(la.q_prev, _mm512_set1_epi64(0x7000 << 32)) == 0
+    {
+        la.c_prev = _mm512_setzero_si512();
+        la.q_prev = _mm512_setzero_si512();
+        return;
+    }
+    transpose8x8(&mut rows);
+    for words in rows {
+        let q = quad_lookup(l, st, la, words);
+        chain_step(st, la, q);
+    }
+}
+
+/// Validate the regions; returns the code of the last byte and the number of continuation
+/// bytes outstanding after the last region, or `None` if invalid.
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+unsafe fn regions_kernel(data: &[u8], len: usize) -> Option<(u8, u8)> {
+    let l = Luts::new();
+    let zero = _mm512_setzero_si512();
+    let mut st = Scan { c_prev: zero, q_prev: zero, pair_max: zero, chain: zero };
+    let base = data.as_ptr() as *const u64;
+    let rg = Regions { row: array::from_fn(|j| base.add(j * len)) };
+
+    // The qword before each region (ASCII before the start) seeds the pair check.
+    let before: [u64; 8] = array::from_fn(|j| if j == 0 { 0 } else { rg.row[j].sub(1).read_unaligned() });
+    let x = _mm512_loadu_si512(before.as_ptr().cast());
+    let y = _mm512_subs_epu8(_mm512_adds_epu8(x, l.one), l.x80);
+    let mut la = Lanes { c_prev: _mm512_permutex2var_epi8(l.code.0, y, l.code.1), q_prev: zero };
+    // First qword of each region: its quad 0 has no predecessor yet (checked at the end),
+    // so pretend the previous step required exactly the state it yields.
+    let words: [u64; 8] = array::from_fn(|j| rg.row[j].read_unaligned());
+    let q_first = quad_lookup(&l, &mut st, &mut la, _mm512_loadu_si512(words.as_ptr().cast()));
+    la.q_prev = _mm512_slli_epi64::<36>(_mm512_and_si512(q_first, _mm512_set1_epi64(0x0700)));
+    chain_step(&mut st, &mut la, q_first);
+
+    let mut i = 1;
+    while i + 8 <= len {
+        block(&l, &rg, &mut st, &mut la, i);
+        i += 8;
+    }
+    let rem = len - i;
+    if rem > 0 {
+        let rows = rg.load_rows_masked(i, rem);
+        for words in &rows[..rem] {
+            let q = quad_lookup(&l, &mut st, &mut la, *words);
+            chain_step(&mut st, &mut la, q);
+        }
+    }
+    if failed_any(&st) {
+        return None;
+    }
+    // Region boundaries: the state required after region r must be the one yielded by
+    // the first quad of region r + 1.
+    let mut first = [0u64; 8];
+    let mut last = [0u64; 8];
+    let mut codes = [0u64; 8];
+    _mm512_storeu_si512(first.as_mut_ptr().cast(), q_first);
+    _mm512_storeu_si512(last.as_mut_ptr().cast(), la.q_prev);
+    _mm512_storeu_si512(codes.as_mut_ptr().cast(), la.c_prev);
+    let needed = |r: usize| (last[r] >> 44) as u8 & 7;
+    for r in 0..REGIONS - 1 {
+        if needed(r) != (first[r + 1] >> 8) as u8 & 7 {
+            return None;
+        }
+    }
+    Some(((codes[7] >> 56) as u8, needed(7)))
+}
+
+/// 8 parallel automata, each validating one region of the input two quads (one qword)
+/// per step. The regions need no synchronisation: a region's first quad is checked
+/// against the previous region's last one at the end.
+#[unsafe(no_mangle)]
+pub fn parallel_automata(data: &[u8]) -> bool {
+    // An ASCII prefix cannot affect validity. Scanning it as one sequential stream is
+    // faster than skipping it region by region.
+    let data = &data[ascii_prefix_len(data)..];
+    // Below this the short regions cost more than they gain.
+    const MIN_LEN: usize = 16 * 1024;
+    if data.len() < MIN_LEN {
+        return check_utf8_avx(data);
+    }
+    let len = data.len() / (REGIONS * 8);
+    match unsafe { regions_kernel(data, len) } {
+        Some((prev, needed)) => finish_scalar(prev, needed, &data[len * REGIONS * 8..]),
+        None => false,
+    }
+}
+
+/// Like `failed`, for pair indices in every byte.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+unsafe fn failed_any(st: &Scan) -> bool {
+    let chain = _mm512_test_epi32_mask(st.chain, _mm512_set1_epi32(0x0700));
+    let pairs = _mm512_cmpeq_epi8_mask(st.pair_max, _mm512_set1_epi8(PAIR_FAIL as i8));
+    chain != 0 || pairs != 0
 }
 
 #[cfg(test)]
@@ -970,6 +949,47 @@ mod tests {
             let expected = str::from_utf8(&buf).is_ok();
             assert_eq!(parallel_automata(&buf), expected, "parallel_automata len {len}");
             assert_eq!(check_utf8_avx(&buf), expected, "check_utf8_avx len {len}");
+        }
+    }
+
+    /// Errors injected around every region boundary of the parallel automata, plus
+    /// truncations and all-ASCII blocks next to multi-byte characters.
+    #[test]
+    fn parallel_region_boundaries() {
+        let text = "aé€😀 ".repeat(2000); // 24 KiB, 12 bytes per repetition
+        let mut buf = text.into_bytes();
+        buf.extend_from_slice(&[b'a'; 1000]); // all-ASCII blocks at the end
+        assert!(parallel_automata(&buf));
+        let regions = 32;
+        let chunk = buf.len() / (regions * 4);
+        let mut positions: Vec<usize> = (0..regions).flat_map(|r| (0..12).map(move |d| r * chunk * 4 + d)).collect();
+        positions.extend((0..buf.len()).step_by(997));
+        for &pos in &positions {
+            if pos >= buf.len() {
+                continue;
+            }
+            for bad in [0x80u8, 0xc3, 0xff, 0x41, 0xe0, 0xa0] {
+                let mut b = buf.clone();
+                b[pos] = bad;
+                assert_eq!(parallel_automata(&b), str::from_utf8(&b).is_ok(), "pos {pos} byte {bad:#x}");
+            }
+            assert_eq!(parallel_automata(&buf[..pos]), str::from_utf8(&buf[..pos]).is_ok(), "truncate {pos}");
+        }
+    }
+
+    #[test]
+    fn transpose8x8_works() {
+        unsafe {
+            let mut r: [__m512i; 8] = array::from_fn(|j| {
+                let row: [u64; 8] = array::from_fn(|k| (j * 8 + k) as u64);
+                _mm512_loadu_si512(row.as_ptr().cast())
+            });
+            transpose8x8(&mut r);
+            for k in 0..8 {
+                let mut out = [0u64; 8];
+                _mm512_storeu_si512(out.as_mut_ptr().cast(), r[k]);
+                assert_eq!(out, array::from_fn(|j| (j * 8 + k) as u64), "qword {k}");
+            }
         }
     }
 }
