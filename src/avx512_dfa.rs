@@ -309,14 +309,6 @@ pub fn parallel_automata(data: &[u8]) -> bool {
                 starts[r] = starts[r - 1] + lens[r - 1];
             }
             let base = data.as_ptr() as *const i32;
-            // Dword min(i, len) of every region of vector v (clamped reads stay in bounds).
-            let gather = |v: usize, i: usize| {
-                let tmp: [i32; 16] = array::from_fn(|j| {
-                    let r = lane_region(v, j);
-                    base.add(starts[r] + i.min(lens[r])).read_unaligned()
-                });
-                _mm512_loadu_epi32(tmp.as_ptr())
-            };
             let classify = |words: __m512i| {
                 let ascii = _mm512_movepi8_mask(words);
                 _mm512_maskz_permutex2var_epi8(ascii, c_lut1, words, c_lut2)
@@ -346,22 +338,6 @@ pub fn parallel_automata(data: &[u8]) -> bool {
                 s
             };
 
-            // First dword: automata only start at a sync byte (ASCII or lead byte).
-            // sb[v][b] bit j: lane j of vector v has synced before byte b.
-            let mut sb = [[0u64; 4]; V];
-            for v in 0..V {
-                let words = gather(v, 0);
-                let sync_bytes = _mm512_cmple_epi8_mask(
-                    classify(words),
-                    _mm512_set1_epi8(ByteClass::Four3 as i8),
-                );
-                sb[v][0] = _pext_u64(sync_bytes, 0x1111111111111111);
-                sb[v][1] = _pext_u64(sync_bytes, 0x2222222222222222) | sb[v][0];
-                sb[v][2] = _pext_u64(sync_bytes, 0x4444444444444444) | sb[v][1];
-                sb[v][3] = _pext_u64(sync_bytes, 0x8888888888888888) | sb[v][2];
-                states[v] = masked_step(states[v], words, sb[v].map(|m| m as u16));
-            }
-
             // Blocks of 8 dwords per region: 8 dwords of regions j and j+8 share one vector
             // (16 ymm loads) and a 16x8 in-register transpose yields 8 words vectors. 8 words
             // per state vector keep all V blocks in registers, so the V dependency chains
@@ -376,11 +352,34 @@ pub fn parallel_automata(data: &[u8]) -> bool {
                     )
                 })
             };
-            let load_block = |v: usize, i: usize| {
-                let mut r = load_rows(v, i);
+            // Partial block of n <= 8 dwords (zero beyond); masked loads are slow, so only
+            // for the ends of the regions.
+            let load_block_masked = |v: usize, i: usize, n: usize| -> [__m512i; 8] {
+                let m = ((1u32 << n) - 1) as __mmask8;
+                let mut r: [__m512i; 8] = array::from_fn(|j| {
+                    let lo = _mm256_maskz_loadu_epi32(m, base.add(starts[lane_region(v, j)] + i));
+                    let hi = _mm256_maskz_loadu_epi32(m, base.add(starts[lane_region(v, j + 8)] + i));
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
+                });
                 transpose8(&mut r);
                 r
             };
+            // First dword: automata only start at a sync byte (ASCII or lead byte).
+            // sb[v][b] bit j: lane j of vector v has synced before byte b.
+            let mut sb = [[0u64; 4]; V];
+            for v in 0..V {
+                let words = load_block_masked(v, 0, 1)[0];
+                let sync_bytes = _mm512_cmple_epi8_mask(
+                    classify(words),
+                    _mm512_set1_epi8(ByteClass::Four3 as i8),
+                );
+                sb[v][0] = _pext_u64(sync_bytes, 0x1111111111111111);
+                sb[v][1] = _pext_u64(sync_bytes, 0x2222222222222222) | sb[v][0];
+                sb[v][2] = _pext_u64(sync_bytes, 0x4444444444444444) | sb[v][1];
+                sb[v][3] = _pext_u64(sync_bytes, 0x8888888888888888) | sb[v][2];
+                states[v] = masked_step(states[v], words, sb[v].map(|m| m as u16));
+            }
+
             let all_ok = |states: __m512i| {
                 _mm512_cmpeq_epi32_mask(_mm512_and_epi32(states, _mm512_set1_epi32(0x1f)), ok)
                     == 0xffff
@@ -411,25 +410,26 @@ pub fn parallel_automata(data: &[u8]) -> bool {
             for v in 0..V {
                 let mut iv = i;
                 while iv + 8 <= vector_len(v) {
-                    for words in load_block(v, iv) {
+                    let mut rows = load_rows(v, iv);
+                    transpose8(&mut rows);
+                    for words in rows {
                         states[v] = step(states[v], words);
                     }
                     iv += 8;
                 }
-                while iv < vector_len(v) {
-                    states[v] = step(states[v], gather(v, iv));
-                    iv += 1;
+                // The leftover dwords plus the first dword of the next region (contiguous).
+                let rem = vector_len(v) - iv;
+                let words = load_block_masked(v, iv, rem + 1);
+                for k in 0..rem {
+                    states[v] = step(states[v], words[k]);
                 }
-            }
-
-            // Each automaton runs into the next region until the point where that region's
-            // automaton synced; the very last one also consumes the 4 extra bytes.
-            for v in 0..V {
+                // Each automaton runs into the next region until the point where that
+                // region's automaton synced; the very last one also consumes the 4 extra bytes.
                 let masks: [u16; 4] = array::from_fn(|b| {
                     let next_vector_synced = if v + 1 < V { sb[v + 1][b] >> 15 } else { 0 };
                     !((sb[v][b] << 1) | next_vector_synced) as u16
                 });
-                states[v] = masked_step(states[v], gather(v, usize::MAX), masks);
+                states[v] = masked_step(states[v], words[rem], masks);
             }
 
             for v in 0..V {
