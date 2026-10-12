@@ -1,5 +1,7 @@
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, measurement::Measurement};
+#[cfg(target_arch = "x86_64")]
 use simdutf8::avx512_dfa::check_utf8_avx as avx512_dfa_utf8;
+#[cfg(target_arch = "x86_64")]
 use simdutf8::avx512_dfa::parallel_automata;
 use simdutf8::basic::from_utf8 as basic_from_utf8;
 use simdutf8::compat::from_utf8 as compat_from_utf8;
@@ -36,7 +38,9 @@ pub enum BenchFn {
     Std,
     ShiftDfa,
     ShiftDfaChunk,
+    #[cfg(target_arch = "x86_64")]
     Avx512Dfa,
+    #[cfg(target_arch = "x86_64")]
     ParallelShifter,
 
     #[cfg(feature = "simdjson")]
@@ -227,6 +231,7 @@ fn bench_input<M: Measurement>(
                 },
             );
         }
+        #[cfg(target_arch = "x86_64")]
         BenchFn::Avx512Dfa => {
             group.bench_with_input(
                 BenchmarkId::from_parameter(format!("{:06}", input.len())),
@@ -236,6 +241,7 @@ fn bench_input<M: Measurement>(
                 },
             );
         }
+        #[cfg(target_arch = "x86_64")]
         BenchFn::ParallelShifter => {
             group.bench_with_input(
                 BenchmarkId::from_parameter(format!("{:06}", input.len())),

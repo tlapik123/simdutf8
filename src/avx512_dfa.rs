@@ -16,7 +16,7 @@
 //! every dword), so the cross-lane shift of the chain check is paid once per 256 bytes.
 
 use core::arch::x86_64::*;
-use std::array;
+use core::array;
 
 
 /// `Fail` state of the count DFA; the others are 0 (`Ok`) and 1..3 (continuation bytes seen).
@@ -299,7 +299,8 @@ const IOTA: __m512i = unsafe {
 
 /// `vpermt2b`: 128-byte table lookup. Written in assembly because LLVM rewrites the
 /// intrinsic with a constant shift index into `valignq` + `vpalignr` (two permutes).
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn lookup2(table_lo: __m512i, idx: __m512i, table_hi: __m512i) -> __m512i {
     let mut t = table_lo;
     core::arch::asm!(
@@ -311,7 +312,8 @@ unsafe fn lookup2(table_lo: __m512i, idx: __m512i, table_hi: __m512i) -> __m512i
 }
 
 /// Zero-masked `vpermi2b`. In assembly because LLVM turns a constant mask into an `and`.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn lookup2_maskz(k: __mmask64, table_lo: __m512i, idx: __m512i, table_hi: __m512i) -> __m512i {
     let mut i = idx;
     core::arch::asm!(
