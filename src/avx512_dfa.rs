@@ -2,7 +2,7 @@
 //! However rather than interpreting the DFA conventionally, the input is converted to
 //! State->State transitions which can then be reduced associatively.
 
-use core::{arch::x86_64::*, mem::transmute};
+use core::arch::x86_64::*;
 use std::{
     array::{self},
     ops::{Add, AddAssign},
@@ -149,24 +149,31 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
         for chunk in chunks {
             transition = merge_adjecent(transition, process_chunk(load(chunk)));
         }
-        remainder
-            .iter()
-            .rev()
-            .map(|c| {
-                *T_LUT.get_unchecked(if *c < 128 {
-                    0
-                } else {
-                    C_LUT[(*c - 128) as usize]
-                } as usize)
-            })
-            .chain(
-                transmute::<__m512i, [u64; 8]>(transition)
-                    .iter()
-                    .copied()
-                    .rev(),
-            )
-            .fold(0, |acc, s| s.to_le_bytes()[acc as usize])
-            == 0
+        // Short tails are cheaper scalar; longer ones go through the vector path.
+        let (vector_tail, scalar_tail) = if remainder.len() > 8 {
+            (remainder, &remainder[remainder.len()..])
+        } else {
+            (&remainder[..0], remainder)
+        };
+        if !vector_tail.is_empty() {
+            // Zero padding is ASCII, which is harmless at the end of the input.
+            let tail = _mm512_maskz_loadu_epi8(
+                _cvtu64_mask64((1u64 << vector_tail.len()) - 1),
+                vector_tail.as_ptr() as *const i8,
+            );
+            transition = merge_adjecent(transition, process_chunk(tail));
+        }
+        // Reduce the 8 lanes (oldest first) in-register: lane 7 is applied first.
+        let t = _mm512_slli_epi64(transition, 3);
+        let t = _mm512_multishift_epi64_epi8(_mm512_unpackhi_epi64(t, t), t);
+        let t = _mm512_multishift_epi64_epi8(_mm512_permutex_epi64::<0x02>(t), t);
+        let t = _mm512_multishift_epi64_epi8(_mm512_shuffle_i64x2::<0x02>(t, t), t);
+        let bulk_transition = _mm_cvtsi128_si64(_mm512_castsi512_si128(t)) as u64;
+        let state = scalar_tail.iter().rev().fold(0u32, |state, c| {
+            let class = if *c < 128 { 0 } else { C_LUT[(*c - 128) as usize] };
+            (T_LUT[class as usize] >> (8 * state)) as u32 & 0xff
+        });
+        (bulk_transition >> (8 * state)) & 0xff == 0
     }
 }
 
