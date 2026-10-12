@@ -141,10 +141,10 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
                 continue;
             }
             prev_ascii = false;
-            transition = merge_adjecent(transition, process_chunk(c0));
-            transition = merge_adjecent(transition, process_chunk(c1));
-            transition = merge_adjecent(transition, process_chunk(c2));
-            transition = merge_adjecent(transition, process_chunk(c3));
+            // Tree-merge the block first so the loop-carried chain is one merge per 256 bytes.
+            let t01 = merge_adjecent(process_chunk(c0), process_chunk(c1));
+            let t23 = merge_adjecent(process_chunk(c2), process_chunk(c3));
+            transition = merge_adjecent(transition, merge_adjecent(t01, t23));
         }
         for chunk in chunks {
             transition = merge_adjecent(transition, process_chunk(load(chunk)));
