@@ -436,6 +436,17 @@ unsafe fn check_utf8_kernel(data: &[u8]) -> bool {
         }
     };
     let mut g = 0;
+    // An all-ASCII remainder (the whole input, typically) only needs the final flush.
+    if n <= 4 {
+        let mut any = zero;
+        for k in 0..n {
+            any = _mm512_or_si512(any, load_k(k));
+        }
+        if _mm512_movepi8_mask(any) == 0 {
+            g = n;
+            st.c_prev = zero;
+        }
+    }
     while g < n {
         let q = match n - g {
             1 => group(&l, &mut st, [load_k(g)]),
@@ -458,7 +469,7 @@ unsafe fn check_utf8_kernel(data: &[u8]) -> bool {
 #[unsafe(no_mangle)]
 pub fn check_utf8_avx(data: &[u8]) -> bool {
     if data.len() < 16 {
-        return crate::shift_dfa::check_utf8_shift(data);
+        return data.iter().fold(0, |a, &b| a | b) < 0x80 || crate::shift_dfa::check_utf8_shift(data);
     }
     unsafe { check_utf8_kernel(data) }
 }
@@ -605,6 +616,7 @@ unsafe fn block(l: &Luts, rg: &Regions, st: &mut Scan, la: &mut Lanes, i: usize)
 
 /// Validate the regions; returns the code of the last byte and the number of continuation
 /// bytes outstanding after the last region, or `None` if invalid.
+#[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
 unsafe fn regions_kernel(data: &[u8], len: usize) -> Option<(u8, u8)> {
     let l = Luts::new();
@@ -629,6 +641,10 @@ unsafe fn regions_kernel(data: &[u8], len: usize) -> Option<(u8, u8)> {
     while i + 8 <= len {
         block(&l, &rg, &mut st, &mut la, i);
         i += 8;
+        // Early exit for invalid input, every 4 KiB.
+        if i % 64 == 1 && failed_any(&st) {
+            return None;
+        }
     }
     let rem = len - i;
     if rem > 0 {
