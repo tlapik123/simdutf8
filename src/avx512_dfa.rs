@@ -238,10 +238,31 @@ unsafe fn transpose8(r: &mut [__m512i; 8]) {
 /// Number of state vectors (16 shift automata each) run in parallel.
 const AUTOMATA_VECTORS: usize = 2;
 
+/// Length of the longest prefix of whole 256-byte blocks that is all ASCII.
+fn ascii_prefix_len(data: &[u8]) -> usize {
+    let (blocks, _) = data.as_chunks::<256>();
+    let mut n = 0;
+    for block in blocks {
+        let non_ascii = unsafe {
+            let load = |k: usize| _mm512_loadu_epi8(block.as_ptr().add(64 * k) as *const i8);
+            let any = _mm512_or_epi64(_mm512_or_epi64(load(0), load(1)), _mm512_or_epi64(load(2), load(3)));
+            _mm512_movepi8_mask(any) != 0
+        };
+        if non_ascii {
+            break;
+        }
+        n += 256;
+    }
+    n
+}
+
 /// 16 * AUTOMATA_VECTORS parallel shift automata
 #[unsafe(no_mangle)]
 pub fn parallel_automata(data: &[u8]) -> bool {
     const V: usize = AUTOMATA_VECTORS;
+    // An ASCII prefix cannot affect validity. Scanning it as one sequential stream is about
+    // twice as fast as skipping it region by region (32 streams defeat the prefetchers).
+    let data = &data[ascii_prefix_len(data)..];
     const REGIONS: usize = 16 * V;
     // The regions of each state vector have a different length (chunk_size + delta, delta a
     // multiple of a cache line) so that the concurrently accessed lines of the regions do not
