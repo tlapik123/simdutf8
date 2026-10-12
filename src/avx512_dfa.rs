@@ -546,9 +546,61 @@ mod tests {
 ".as_bytes();
         for len in 0..data.len() {
             let input = &data[0..len];
-            let avx = parallel_automata(input);
-            // let avx = check_utf8_avx(input);
-            assert_eq!(avx, str::from_utf8(input).is_ok());
+            let expected = str::from_utf8(input).is_ok();
+            assert_eq!(parallel_automata(input), expected, "parallel_automata len {len}");
+            assert_eq!(check_utf8_avx(input), expected, "check_utf8_avx len {len}");
+        }
+    }
+
+    /// Random mixes of valid UTF-8 and injected errors, checked against std for both kernels.
+    #[test]
+    fn random_inputs() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const BAD: &[&[u8]] = &[
+            b"\x80", b"\xbf", b"\xc0\x80", b"\xc1\xbf", b"\xf5\x80\x80\x80", b"\xff",
+            b"\xe0\x80\x80", b"\xe0\x9f\xbf", b"\xed\xa0\x80", b"\xf0\x80\x80\x80",
+            b"\xf0\x8f\xbf\xbf", b"\xf4\x90\x80\x80", b"\xc3", b"\xe2\x82", b"\xf0\x9f\x98",
+            b"\xe2\x28\xa1",
+        ];
+        let mut buf = Vec::new();
+        for _ in 0..3000 {
+            buf.clear();
+            let len = (rng() % 8192) as usize;
+            let ascii_heavy = rng() % 3 == 0;
+            let err_rate = rng() % 4; // 0 = valid only
+            while buf.len() < len {
+                let r = rng();
+                if err_rate > 0 && r % 1000 < err_rate * 2 {
+                    buf.extend_from_slice(BAD[(r >> 16) as usize % BAD.len()]);
+                    continue;
+                }
+                let c = if ascii_heavy && r % 8 != 0 {
+                    char::from(b' ' + (r >> 8) as u8 % 95)
+                } else {
+                    match r % 4 {
+                        0 => char::from((r >> 8) as u8 & 0x7f),
+                        1 => char::from_u32(0x80 + (r >> 8) as u32 % 0x780).unwrap(),
+                        2 => loop {
+                            if let Some(c) = char::from_u32(0x800 + (rng() >> 8) as u32 % 0xf800) {
+                                break c;
+                            }
+                        },
+                        _ => char::from_u32(0x1_0000 + (r >> 8) as u32 % 0x10_0000).unwrap(),
+                    }
+                };
+                let mut tmp = [0u8; 4];
+                buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            }
+            buf.truncate(len);
+            let expected = str::from_utf8(&buf).is_ok();
+            assert_eq!(parallel_automata(&buf), expected, "parallel_automata len {len}");
+            assert_eq!(check_utf8_avx(&buf), expected, "check_utf8_avx len {len}");
         }
     }
 }
