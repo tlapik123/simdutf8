@@ -691,6 +691,10 @@ mod tests {
             let len = if rng() % 8 == 0 { (rng() % 65536) as usize } else { (rng() % 8192) as usize };
             let ascii_heavy = rng() % 3 == 0;
             let err_rate = rng() % 4; // 0 = valid only
+            // Sometimes a long pure-ASCII prefix (exercises the prefix skip and its boundary).
+            if rng() % 4 == 0 {
+                buf.resize((rng() % 4096) as usize, b'a');
+            }
             while buf.len() < len {
                 let r = rng();
                 if err_rate > 0 && r % 1000 < err_rate * 2 {
