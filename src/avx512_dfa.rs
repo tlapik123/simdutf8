@@ -52,8 +52,7 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
         let _shuffle_offset = _mm512_maskz_set1_epi32(_cvtu32_mask16(0xcccc), 0x08080808);
 
         #[rustfmt::skip]
-        let process_chunk = |chunk: &[u8; 64]| {
-            let chunk = _mm512_loadu_epi8(chunk.as_ptr() as *const i8);
+        let process_chunk = |chunk: __m512i| {
             let mask = _mm512_movepi8_mask(chunk);
             // if mask == 0 {
             //     _mm512_set1_epi64(T_LUT[0] as i64)
@@ -121,12 +120,35 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
         // };
 
         let (bulk, remainder) = data.as_chunks::<64>();
-        let transition = bulk
-            .iter()
-            .map(process_chunk)
-            .fold(_mm512_set1_epi64(0x0706050403020100), |a, b| {
-                merge_adjecent(a, b)
-            });
+        let load = |chunk: &[u8; 64]| _mm512_loadu_epi8(chunk.as_ptr() as *const i8);
+        // Transition function of an all-ASCII chunk: 0 -> 0, everything else -> error. It is
+        // idempotent, so a run of ASCII chunks only needs to be merged once.
+        let ascii_transition = _mm512_set1_epi64(T_LUT[0] as i64);
+        let mut transition = _mm512_set1_epi64(0x0706050403020100);
+        let (blocks, chunks) = bulk.as_chunks::<4>();
+        let mut prev_ascii = false;
+        for block in blocks {
+            let c0 = load(&block[0]);
+            let c1 = load(&block[1]);
+            let c2 = load(&block[2]);
+            let c3 = load(&block[3]);
+            let any = _mm512_or_epi64(_mm512_or_epi64(c0, c1), _mm512_or_epi64(c2, c3));
+            if _mm512_movepi8_mask(any) == 0 {
+                if !prev_ascii {
+                    transition = merge_adjecent(transition, ascii_transition);
+                    prev_ascii = true;
+                }
+                continue;
+            }
+            prev_ascii = false;
+            transition = merge_adjecent(transition, process_chunk(c0));
+            transition = merge_adjecent(transition, process_chunk(c1));
+            transition = merge_adjecent(transition, process_chunk(c2));
+            transition = merge_adjecent(transition, process_chunk(c3));
+        }
+        for chunk in chunks {
+            transition = merge_adjecent(transition, process_chunk(load(chunk)));
+        }
         remainder
             .iter()
             .rev()
