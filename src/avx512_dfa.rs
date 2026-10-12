@@ -344,16 +344,34 @@ pub fn parallel_automata(data: &[u8]) -> bool {
 
             // Blocks of 16 dwords per region: 16 vector loads + an in-register 16x16 dword
             // transpose per vector instead of scalar gathers.
+            let load_rows = |v: usize, i: usize| -> [__m512i; 16] {
+                array::from_fn(|j| _mm512_loadu_epi32(base.add(starts[lane_region(v, j)] + i)))
+            };
             let load_block = |v: usize, i: usize| {
-                let mut r: [__m512i; 16] = array::from_fn(|j| {
-                    _mm512_loadu_epi32(base.add(starts[lane_region(v, j)] + i))
-                });
+                let mut r = load_rows(v, i);
                 transpose16(&mut r);
                 r
             };
+            let all_ok = |states: __m512i| {
+                _mm512_cmpeq_epi32_mask(_mm512_and_epi32(states, _mm512_set1_epi32(0x1f)), ok)
+                    == 0xffff
+            };
             let mut i = 1;
             while i + 16 <= vector_len(0) {
-                let words: [[__m512i; 16]; V] = array::from_fn(|v| load_block(v, i));
+                let mut rows: [[__m512i; 16]; V] = array::from_fn(|v| load_rows(v, i));
+                // An all-ASCII block keeps every automaton that is in the Ok state in Ok.
+                let any = rows
+                    .iter()
+                    .flatten()
+                    .fold(_mm512_setzero_si512(), |a, b| _mm512_or_epi64(a, *b));
+                if _mm512_movepi8_mask(any) == 0 && states.iter().all(|s| all_ok(*s)) {
+                    i += 16;
+                    continue;
+                }
+                for r in &mut rows {
+                    transpose16(r);
+                }
+                let words = rows;
                 for k in 0..16 {
                     for v in 0..V {
                         states[v] = step(states[v], words[v][k]);
