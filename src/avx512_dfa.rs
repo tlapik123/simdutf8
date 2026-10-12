@@ -1,219 +1,467 @@
-//! An UTF-8 validation implemented using a DFA.
-//! However rather than interpreting the DFA conventionally, the input is converted to
-//! State->State transitions which can then be reduced associatively.
+//! UTF-8 validation based on a DFA whose transitions are reduced associatively.
+//!
+//! The input is validated by a reverse DFA that only counts continuation bytes
+//! (states: `Ok`, 1..3 continuation bytes seen, `Fail`); its transition function for
+//! any block of 4 or more bytes is either all-`Fail` or "accepts exactly one incoming
+//! state `s` and yields state `v`". Composing adjacent blocks therefore reduces to the
+//! local check `s_i == v_{i+1}`, which is what the kernel does on 4-byte quads.
+//! The constraints on the first continuation byte (overlongs, surrogates, > U+10FFFF)
+//! and the illegal bytes are checked on every adjacent byte pair through a lookup
+//! keyed by the pair's byte classes.
+//!
+//! Per 64-byte chunk: classify (1 `vpermi2b`), shift the classes by one byte
+//! (1 `vpermi2b`), look up the pair functions of all 64 adjacent pairs (1 `vpermi2b`),
+//! fold two pair indices into a quad key (`vpmaddwd`) and look up the quad's (s, v)
+//! (1 `vpermi2b`). Four chunks' quad results share one vector (one byte per chunk in
+//! every dword), so the cross-lane shift of the chain check is paid once per 256 bytes.
 
 use core::arch::x86_64::*;
-use std::{
-    array::{self},
-    ops::{Add, AddAssign},
-};
+use std::array;
 
 use crate::shift_dfa::{dfa_ror_offset, ByteClass, ForwardDfa, CLASS_LUT, ROR_CLASS_LUT};
 
-static C_LUT: [u8; 128] = [
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-    4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-    6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 7, 9, 10, 10, 10, 11, 12, 12, 12, 12, 12, 12, 12,
-    12, 12, 12, 12,
-];
+/// `Fail` state of the count DFA; the others are 0 (`Ok`) and 1..3 (continuation bytes seen).
+const F: u8 = 4;
 
-/// Full transition LUT
-pub static T_LUT: [u64; 16] = [
-    0x06_06_06_06_06_06_00,
-    0x06_06_06_04_04_02_01,
-    0x06_06_06_05_05_02_01,
-    0x06_06_06_05_05_03_01,
-    0x06_06_06_06_06_06_06,
-    0x06_06_06_06_06_00_06,
-    0x06_06_06_00_06_06_06,
-    0x06_06_06_00_00_06_06,
-    0x06_06_06_06_00_06_06,
-    0x06_00_06_06_06_06_06,
-    0x06_00_00_06_06_06_06,
-    0x06_06_00_06_06_06_06,
-    0x06_06_06_06_06_06_06,
-    0x00_00_00_00_00_00_00,
-    0x00_00_00_00_00_00_00,
-    0x00_00_00_00_00_00_00,
-];
+/// Structural byte classes of the count DFA.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Class {
+    Ascii,
+    Cont,
+    Lead2,
+    Lead3,
+    Lead4,
+    Illegal,
+}
 
+const fn count_step(class: Class, s: u8) -> u8 {
+    match class {
+        Class::Ascii => if s == 0 { 0 } else { F },
+        Class::Cont => if s < 3 { s + 1 } else { F },
+        Class::Lead2 => if s == 1 { 0 } else { F },
+        Class::Lead3 => if s == 2 { 0 } else { F },
+        Class::Lead4 => if s == 3 { 0 } else { F },
+        Class::Illegal => F,
+    }
+}
+
+/// Codes of a byte in the first (`a`) and second (`b`) position of a byte pair.
+/// `a` distinguishes the leads that constrain their first continuation byte, `b` the
+/// continuation byte ranges. The code byte of the classifier is `a << 3 | b`.
+const A_ASCII: u8 = 0;
+const A_CONT: u8 = 1;
+const A_LEAD2: u8 = 2;
+const A_LEAD3: u8 = 3;
+const A_LEAD4: u8 = 4;
+const A_E0: u8 = 5;
+const A_ED: u8 = 6;
+const A_F0: u8 = 7;
+const A_F4: u8 = 8;
+const A_ILLEGAL: u8 = 9;
+const A_COUNT: usize = 10;
+
+const B_ASCII: u8 = 0;
+const B_CONT_80: u8 = 1;
+const B_CONT_90: u8 = 2;
+const B_CONT_A0: u8 = 3;
+const B_LEAD2: u8 = 4;
+const B_LEAD3: u8 = 5;
+const B_LEAD4: u8 = 6;
+const B_ILLEGAL: u8 = 7;
+
+const fn a_code(x: u8) -> u8 {
+    match x {
+        0x00..=0x7f => A_ASCII,
+        0x80..=0xbf => A_CONT,
+        0xc2..=0xdf => A_LEAD2,
+        0xe0 => A_E0,
+        0xed => A_ED,
+        0xe1..=0xef => A_LEAD3,
+        0xf0 => A_F0,
+        0xf4 => A_F4,
+        0xf1..=0xf3 => A_LEAD4,
+        _ => A_ILLEGAL,
+    }
+}
+
+const fn b_code(x: u8) -> u8 {
+    match x {
+        0x00..=0x7f => B_ASCII,
+        0x80..=0x8f => B_CONT_80,
+        0x90..=0x9f => B_CONT_90,
+        0xa0..=0xbf => B_CONT_A0,
+        0xc2..=0xdf => B_LEAD2,
+        0xe0..=0xef => B_LEAD3,
+        0xf0..=0xf4 => B_LEAD4,
+        _ => B_ILLEGAL,
+    }
+}
+
+const fn a_class(a: u8) -> Class {
+    match a {
+        A_ASCII => Class::Ascii,
+        A_CONT => Class::Cont,
+        A_LEAD2 => Class::Lead2,
+        A_LEAD3 | A_E0 | A_ED => Class::Lead3,
+        A_LEAD4 | A_F0 | A_F4 => Class::Lead4,
+        _ => Class::Illegal,
+    }
+}
+
+const fn b_class(b: u8) -> Class {
+    match b {
+        B_ASCII => Class::Ascii,
+        B_CONT_80 | B_CONT_90 | B_CONT_A0 => Class::Cont,
+        B_LEAD2 => Class::Lead2,
+        B_LEAD3 => Class::Lead3,
+        B_LEAD4 => Class::Lead4,
+        _ => Class::Illegal,
+    }
+}
+
+/// Is `b` a continuation byte that may not follow the lead `a`?
+const fn forbidden(a: u8, b: u8) -> bool {
+    match a {
+        A_E0 => b == B_CONT_80 || b == B_CONT_90, // overlong
+        A_ED => b == B_CONT_A0,                   // surrogate
+        A_F0 => b == B_CONT_80,                   // overlong
+        A_F4 => b == B_CONT_90 || b == B_CONT_A0, // > U+10FFFF
+        _ => false,
+    }
+}
+
+type Fn5 = [u8; 5];
+const ALL_FAIL: Fn5 = [F; 5];
+
+/// Transition function of the byte pair (a, b): the DFA runs backwards, so `b` first.
+const fn pair_fn(a: u8, b: u8) -> Fn5 {
+    if forbidden(a, b) {
+        return ALL_FAIL;
+    }
+    let mut f = ALL_FAIL;
+    let mut s = 0;
+    while s < 5 {
+        f[s as usize] = count_step(a_class(a), count_step(b_class(b), s));
+        s += 1;
+    }
+    f
+}
+
+const fn fn_eq(f: Fn5, g: Fn5) -> bool {
+    let mut s = 0;
+    while s < 5 {
+        if f[s] != g[s] {
+            return false;
+        }
+        s += 1;
+    }
+    true
+}
+
+/// The distinct pair functions, all-fail last.
+const PAIR_FNS: ([Fn5; 10], usize) = {
+    let mut fns = [ALL_FAIL; 10];
+    let mut n = 0;
+    let mut a = 0;
+    while a < A_COUNT as u8 {
+        let mut b = 0;
+        while b < 8 {
+            let f = pair_fn(a, b);
+            let mut i = 0;
+            while i < n && !fn_eq(fns[i], f) {
+                i += 1;
+            }
+            if i == n && !fn_eq(f, ALL_FAIL) {
+                fns[n] = f;
+                n += 1;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    assert!(n == 9);
+    (fns, n + 1)
+};
+const PAIR_FAIL: u8 = 9;
+
+/// Pair key `a << 3 | b` -> pair function index (0..=9, 9 = all-fail).
+static PAIR_LUT: [u8; 128] = {
+    let mut lut = [PAIR_FAIL; 128];
+    let mut a = 0;
+    while a < A_COUNT as u8 {
+        let mut b = 0;
+        while b < 8 {
+            let f = pair_fn(a, b);
+            let mut i = 0;
+            while i < 9 && !fn_eq(PAIR_FNS.0[i], f) {
+                i += 1;
+            }
+            lut[(a << 3 | b) as usize] = i as u8;
+            b += 1;
+        }
+        a += 1;
+    }
+    lut
+};
+
+/// Quad key `10 * pa + pb` -> `v | s << 4` where the quad accepts the incoming state `s`
+/// and yields `v`; all-fail quads get the sentinels `s = 4`, `v = 5`, which match nothing.
+static QUAD_LUT: [u8; 128] = {
+    let mut lut = [0x45; 128];
+    let mut pa = 0;
+    while pa < 10 {
+        let mut pb = 0;
+        while pb < 10 {
+            let (fa, fb) = (PAIR_FNS.0[pa], PAIR_FNS.0[pb]);
+            let mut code = 0x45u8;
+            let mut s = 0;
+            while s < 4 {
+                let v = fa[fb[s] as usize];
+                if v != F {
+                    assert!(code == 0x45, "quad accepts more than one state");
+                    code = v | (s as u8) << 4;
+                }
+                s += 1;
+            }
+            lut[10 * pa + pb] = code;
+            pb += 1;
+        }
+        pa += 1;
+    }
+    lut
+};
+
+/// Classifier table, indexed by `saturating_sub(saturating_add(x, 1), 0x80)`: 0 for ASCII,
+/// `x - 0x7f` otherwise (0xfe and 0xff collide, both are illegal).
+static CODE_LUT: [u8; 128] = {
+    let mut lut = [0u8; 128];
+    let mut i = 1;
+    while i < 128 {
+        let x = 0x7f + i as u8;
+        lut[i] = a_code(x) << 3 | b_code(x);
+        i += 1;
+    }
+    lut
+};
+
+#[inline]
+unsafe fn load_lut(lut: &[u8; 128]) -> (__m512i, __m512i) {
+    (
+        _mm512_loadu_si512(lut.as_ptr().cast()),
+        _mm512_loadu_si512(lut.as_ptr().add(64).cast()),
+    )
+}
+
+/// All the loop-invariant vectors of the kernel.
+struct Luts {
+    code: (__m512i, __m512i),
+    pair: (__m512i, __m512i),
+    quad: (__m512i, __m512i),
+    /// `permutex2var_epi8` indices shifting (prev, cur) right by one byte.
+    shift1: __m512i,
+    /// 0x78 in every byte: the `a` part of a code byte.
+    a_mask: __m512i,
+    /// `vpmaddwd` weights folding (pa, pb) into `10 * pa + pb` in byte 1 / byte 2 of each dword.
+    w1: __m512i,
+    w2: __m512i,
+    one: __m512i,
+    x80: __m512i,
+}
+
+impl Luts {
+    #[inline]
+    unsafe fn new() -> Self {
+        Self {
+            code: load_lut(&CODE_LUT),
+            pair: load_lut(&PAIR_LUT),
+            quad: load_lut(&QUAD_LUT),
+            shift1: _mm512_add_epi8(_mm512_set1_epi8(63), IOTA),
+            a_mask: _mm512_set1_epi8(0x78),
+            w1: _mm512_set1_epi32(10 | 1 << 16),
+            w2: _mm512_set1_epi32(2560 | 256 << 16),
+            one: _mm512_set1_epi8(1),
+            x80: _mm512_set1_epi8(0x80u8 as i8),
+        }
+    }
+}
+
+const IOTA: __m512i = unsafe {
+    core::mem::transmute::<[u8; 64], __m512i>({
+        let mut a = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            a[i] = i as u8;
+            i += 1;
+        }
+        a
+    })
+};
+
+/// `vpermt2b`: 128-byte table lookup. Written in assembly because LLVM rewrites the
+/// intrinsic with a constant shift index into `valignq` + `vpalignr` (two permutes).
+#[inline(always)]
+unsafe fn lookup2(table_lo: __m512i, idx: __m512i, table_hi: __m512i) -> __m512i {
+    let mut t = table_lo;
+    core::arch::asm!(
+        "vpermt2b {t}, {i}, {h}",
+        t = inout(zmm_reg) t, i = in(zmm_reg) idx, h = in(zmm_reg) table_hi,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    t
+}
+
+/// Zero-masked `vpermi2b`. In assembly because LLVM turns a constant mask into an `and`.
+#[inline(always)]
+unsafe fn lookup2_maskz(k: __mmask64, table_lo: __m512i, idx: __m512i, table_hi: __m512i) -> __m512i {
+    let mut i = idx;
+    core::arch::asm!(
+        "vpermi2b {i}{{{k}}}{{z}}, {lo}, {hi}",
+        i = inout(zmm_reg) i, k = in(kreg) k, lo = in(zmm_reg) table_lo, hi = in(zmm_reg) table_hi,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    i
+}
+
+/// State carried between chunks.
+struct Scan {
+    /// Code bytes of the previous chunk (zero: ASCII).
+    c_prev: __m512i,
+    /// Quad results of the previous group of four chunks, chunk `c` in byte `c` of each dword.
+    q_prev: __m512i,
+    /// Byte-wise maximum of the pair indices; 9 in an even byte means a failed pair.
+    pair_max: __m512i,
+    /// OR of `s ^ v'` of adjacent quads (bits 0..2 of each byte); nonzero means a mismatch.
+    chain: __m512i,
+}
+
+/// Process up to four chunks; returns their quad results interleaved by byte
+/// (chunk `c` in byte `c` of every dword, missing chunks count as ASCII).
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+unsafe fn group<const N: usize>(l: &Luts, st: &mut Scan, x: [__m512i; N]) -> __m512i {
+    let mut q = [_mm512_setzero_si512(); 4];
+    for (c, x) in IntoIterator::into_iter(x).enumerate() {
+        // 0 for ASCII, x - 0x7f otherwise, so that a single 128-entry table classifies.
+        let y = _mm512_subs_epu8(_mm512_adds_epu8(x, l.one), l.x80);
+        let code = _mm512_permutex2var_epi8(l.code.0, y, l.code.1);
+        // byte i: a-code of byte i-1, b-code of byte i
+        let prev = lookup2(st.c_prev, l.shift1, code);
+        st.c_prev = code;
+        let key = _mm512_ternarylogic_epi32::<0xCA>(l.a_mask, prev, code);
+        // Even bytes: pairs (i-1, i) with odd i-1 -> only checked for failure.
+        // Odd bytes: pairs (2k, 2k+1) -> folded into quads below.
+        let pair = _mm512_permutex2var_epi8(l.pair.0, key, l.pair.1);
+        st.pair_max = _mm512_max_epu8(st.pair_max, pair);
+        // byte 1 (w1) / byte 2 (w2) of each dword: 10 * pa + pb; the other bytes hold junk
+        let qk = match c {
+            0 => _mm512_srli_epi32::<8>(_mm512_madd_epi16(pair, l.w1)),
+            1 => _mm512_madd_epi16(pair, l.w1),
+            2 => _mm512_madd_epi16(pair, l.w2),
+            _ => _mm512_slli_epi32::<8>(_mm512_madd_epi16(pair, l.w2)),
+        };
+        q[c] = lookup2_maskz(0x1111_1111_1111_1111 << c, l.quad.0, qk, l.quad.1);
+    }
+    match N {
+        1 => q[0],
+        2 => _mm512_or_si512(q[0], q[1]),
+        3 => _mm512_ternarylogic_epi32::<0xFE>(q[0], q[1], q[2]),
+        _ => _mm512_or_si512(_mm512_ternarylogic_epi32::<0xFE>(q[0], q[1], q[2]), q[3]),
+    }
+}
+
+/// Chain check between the previous group (`st.q_prev`) and the next one (`q`):
+/// the state `s` accepted by quad i must be the state `v` yielded by quad i + 1.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+unsafe fn chain(st: &mut Scan, q: __m512i) {
+    // v of the next quad: dword i+1 of q_prev, for lane 15 (and the chunk in byte 3) the
+    // next chunk's dword 0, i.e. q_prev's dword 0 shifted down a byte with q's dword 0 on top.
+    let wrap = _mm512_shrdi_epi32::<8>(st.q_prev, q);
+    let next = _mm512_alignr_epi32::<1>(wrap, st.q_prev);
+    let s = _mm512_srli_epi32::<4>(st.q_prev);
+    st.chain = _mm512_ternarylogic_epi32::<0xF6>(st.chain, s, next);
+    st.q_prev = q;
+}
+
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+unsafe fn failed(st: &Scan) -> bool {
+    let chain = _mm512_test_epi8_mask(st.chain, _mm512_set1_epi8(7));
+    let pairs = _mm512_mask_cmpeq_epi8_mask(
+        0x5555_5555_5555_5555,
+        st.pair_max,
+        _mm512_set1_epi8(PAIR_FAIL as i8),
+    );
+    (chain | pairs) != 0
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+unsafe fn check_utf8_kernel(data: &[u8]) -> bool {
+    let l = Luts::new();
+    let zero = _mm512_setzero_si512();
+    let mut st = Scan { c_prev: zero, q_prev: zero, pair_max: zero, chain: zero };
+    let load = |chunk: &[u8; 64]| _mm512_loadu_si512(chunk.as_ptr().cast());
+
+    let (blocks, rest) = data.as_chunks::<512>();
+    for block in blocks {
+        let x: [__m512i; 8] = array::from_fn(|k| load(block[64 * k..].first_chunk::<64>().unwrap()));
+        let any = _mm512_or_si512(
+            _mm512_ternarylogic_epi32::<0xFE>(x[0], x[1], x[2]),
+            _mm512_ternarylogic_epi32::<0xFE>(x[3], x[4], x[5]),
+        );
+        let any = _mm512_ternarylogic_epi32::<0xFE>(any, x[6], x[7]);
+        if _mm512_movepi8_mask(any) == 0 {
+            // All-ASCII: every quad is (0, 0); only the boundary to the previous group matters.
+            chain(&mut st, zero);
+            st.c_prev = zero;
+            continue;
+        }
+        let q = group(&l, &mut st, [x[0], x[1], x[2], x[3]]);
+        chain(&mut st, q);
+        let q = group(&l, &mut st, [x[4], x[5], x[6], x[7]]);
+        chain(&mut st, q);
+        if failed(&st) {
+            return false;
+        }
+    }
+
+    let (chunks, tail) = rest.as_chunks::<64>();
+    let n = chunks.len() + usize::from(!tail.is_empty());
+    let load_k = |k: usize| {
+        if k < chunks.len() {
+            load(&chunks[k])
+        } else {
+            // Zero padding is ASCII, which is harmless at the end of the input.
+            _mm512_maskz_loadu_epi8(_cvtu64_mask64((1u64 << tail.len()) - 1), tail.as_ptr().cast())
+        }
+    };
+    let mut g = 0;
+    while g < n {
+        let q = match n - g {
+            1 => group(&l, &mut st, [load_k(g)]),
+            2 => group(&l, &mut st, [load_k(g), load_k(g + 1)]),
+            3 => group(&l, &mut st, [load_k(g), load_k(g + 1), load_k(g + 2)]),
+            _ => group(&l, &mut st, [load_k(g), load_k(g + 1), load_k(g + 2), load_k(g + 3)]),
+        };
+        chain(&mut st, q);
+        g += 4;
+    }
+    // The last quad must not need continuation bytes.
+    chain(&mut st, zero);
+    !failed(&st)
+}
+
+/// UTF-8 validation by associative reduction of DFA transitions (see the module docs).
+///
 /// # Safety
-/// Lul no :kekwyou:
+/// Requires AVX-512 F/BW/VBMI/VBMI2, which is not checked.
 #[unsafe(no_mangle)]
 pub fn check_utf8_avx(data: &[u8]) -> bool {
-    unsafe {
-        let c_lut1 = _mm512_loadu_epi8(&C_LUT[0] as *const u8 as *const i8);
-        let c_lut2 = _mm512_loadu_epi8(&C_LUT[64] as *const u8 as *const i8);
-        let t_lut1 = _mm512_loadu_epi64(&T_LUT[0] as *const u64 as *const i64);
-        let t_lut2 = _mm512_loadu_epi64(&T_LUT[8] as *const u64 as *const i64);
-        let s_lut1 = _mm512_slli_epi64(t_lut1, 3);
-        let s_lut2 = _mm512_slli_epi64(t_lut2, 3);
-        let _shuffle_offset = _mm512_maskz_set1_epi32(_cvtu32_mask16(0xcccc), 0x08080808);
-
-        #[rustfmt::skip]
-        let process_chunk = |chunk: __m512i| {
-            let mask = _mm512_movepi8_mask(chunk);
-            // if mask == 0 {
-            //     _mm512_set1_epi64(T_LUT[0] as i64)
-            // } else {
-                // let classes = _mm512_maskz_permutex2var_epi8(mask, c_lut1, chunk, c_lut2);
-                // let transitions_0 = _mm512_permutex2var_epi64(t_lut1, classes, t_lut2);
-                // let transitions_1 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 8), t_lut2);
-                // let transitions_2 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 16), t_lut2);
-                // let transitions_3 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 24), t_lut2);
-                // let transitions_4 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 32), t_lut2);
-                // let transitions_5 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 40), t_lut2);
-                // let transitions_6 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 48), t_lut2);
-                // let transitions_7 = _mm512_permutex2var_epi64(t_lut1, _mm512_srli_epi64(classes, 56), t_lut2);
-                // let transitions_01 = _mm512_shuffle_epi8(transitions_0, _mm512_or_epi64(transitions_1, shuffle_offset));
-                // let transitions_23 = _mm512_shuffle_epi8(transitions_2, _mm512_or_epi64(transitions_3, shuffle_offset));
-                // let transitions_45 = _mm512_shuffle_epi8(transitions_4, _mm512_or_epi64(transitions_5, shuffle_offset));
-                // let transitions_67 = _mm512_shuffle_epi8(transitions_6, _mm512_or_epi64(transitions_7, shuffle_offset));
-                // let transitions_0123 = _mm512_shuffle_epi8(transitions_01, _mm512_or_epi64(transitions_23, shuffle_offset));
-                // let transitions_4567 = _mm512_shuffle_epi8(transitions_45, _mm512_or_epi64(transitions_67, shuffle_offset));
-                // _mm512_shuffle_epi8(transitions_0123, _mm512_or_epi64(transitions_4567, shuffle_offset))
-                let classes = _mm512_maskz_permutex2var_epi8(mask, c_lut1, chunk, c_lut2);
-                let transitions_0 = _mm512_permutex2var_epi64(s_lut1, classes, s_lut2);
-                let transitions_1 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 8), s_lut2);
-                let transitions_2 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 16), s_lut2);
-                let transitions_3 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 24), s_lut2);
-                let transitions_4 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 32), s_lut2);
-                let transitions_5 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 40), s_lut2);
-                let transitions_6 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 48), s_lut2);
-                let transitions_7 = _mm512_permutex2var_epi64(s_lut1, _mm512_srli_epi64(classes, 56), s_lut2);
-                let transitions_01 = _mm512_multishift_epi64_epi8(transitions_1, transitions_0);
-                let transitions_23 = _mm512_multishift_epi64_epi8(transitions_3, transitions_2);
-                let transitions_45 = _mm512_multishift_epi64_epi8(transitions_5, transitions_4);
-                let transitions_67 = _mm512_multishift_epi64_epi8(transitions_7, transitions_6);
-                let transitions_0123 = _mm512_multishift_epi64_epi8(transitions_23, transitions_01);
-                let transitions_4567 = _mm512_multishift_epi64_epi8(transitions_67, transitions_45);
-                let transitions_01234567 =_mm512_multishift_epi64_epi8(transitions_4567, transitions_0123);
-                _mm512_srli_epi64(transitions_01234567, 3)
-            // }
-        };
-
-        // NOTE: Merging can be done using 2 shuffles to perform a horizontal reduction in each
-        // vector separately and then a permute to join them together. This should result in lower
-        // latency on most CPUs, but likely worse throughput.
-        let merge_shuffle = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
-        let merge_mask = _mm512_set_epi64(
-            0x7070707070707070u64 as i64,
-            0x6060606060606060u64 as i64,
-            0x5050505050505050u64 as i64,
-            0x4040404040404040u64 as i64,
-            0x3030303030303030u64 as i64,
-            0x2020202020202020u64 as i64,
-            0x1010101010101010u64 as i64,
-            0x0000000000000000u64 as i64,
-        );
-        let merge_adjecent = |a: __m512i, b: __m512i| {
-            let idx = _mm512_permutex2var_epi64(a, merge_shuffle, b);
-            let idx = _mm512_or_epi64(idx, merge_mask);
-            _mm512_permutex2var_epi8(a, idx, b)
-        };
-
-        // let merge_adjecent = |a: __m512i, b: __m512i| {
-        //     let a = _mm512_shuffle_epi8(a, a);
-        //     let b = _mm512_shuffle_epi8(b, b);
-        //     _mm512_permutex2var_epi64(a, merge_shuffle, b)
-        // };
-
-        let (bulk, remainder) = data.as_chunks::<64>();
-        let load = |chunk: &[u8; 64]| _mm512_loadu_epi8(chunk.as_ptr() as *const i8);
-        // Transition function of an all-ASCII chunk: 0 -> 0, everything else -> error. It is
-        // idempotent, so a run of ASCII chunks only needs to be merged once.
-        let ascii_transition = _mm512_set1_epi64(T_LUT[0] as i64);
-        let mut transition = _mm512_set1_epi64(0x0706050403020100);
-        let (blocks, chunks) = bulk.as_chunks::<8>();
-        let mut prev_ascii = false;
-        for block in blocks {
-            let c: [__m512i; 8] = array::from_fn(|k| load(&block[k]));
-            // Tree-shaped OR: short dependency chain for the (common) all-ASCII case.
-            let mut any = c;
-            let mut n = any.len();
-            while n > 1 {
-                n /= 2;
-                for k in 0..n {
-                    any[k] = _mm512_or_epi64(any[k], any[k + n]);
-                }
-            }
-            let any = any[0];
-            if _mm512_movepi8_mask(any) == 0 {
-                if !prev_ascii {
-                    transition = merge_adjecent(transition, ascii_transition);
-                    prev_ascii = true;
-                }
-                continue;
-            }
-            prev_ascii = false;
-            // Tree-merge the block first so the loop-carried chain is one merge per 512 bytes.
-            let t: [__m512i; 4] =
-                array::from_fn(|k| merge_adjecent(process_chunk(c[2 * k]), process_chunk(c[2 * k + 1])));
-            let t01 = merge_adjecent(t[0], t[1]);
-            let t23 = merge_adjecent(t[2], t[3]);
-            transition = merge_adjecent(transition, merge_adjecent(t01, t23));
-        }
-        for chunk in chunks {
-            transition = merge_adjecent(transition, process_chunk(load(chunk)));
-        }
-        // Short tails are cheaper scalar; longer ones go through the vector path.
-        let (vector_tail, scalar_tail) = if remainder.len() > 8 {
-            (remainder, &remainder[remainder.len()..])
-        } else {
-            (&remainder[..0], remainder)
-        };
-        if !vector_tail.is_empty() {
-            // Zero padding is ASCII, which is harmless at the end of the input.
-            let tail = _mm512_maskz_loadu_epi8(
-                _cvtu64_mask64((1u64 << vector_tail.len()) - 1),
-                vector_tail.as_ptr() as *const i8,
-            );
-            transition = merge_adjecent(transition, process_chunk(tail));
-        }
-        // Reduce the 8 lanes (oldest first) in-register: lane 7 is applied first.
-        let t = _mm512_slli_epi64(transition, 3);
-        let t = _mm512_multishift_epi64_epi8(_mm512_unpackhi_epi64(t, t), t);
-        let t = _mm512_multishift_epi64_epi8(_mm512_permutex_epi64::<0x02>(t), t);
-        let t = _mm512_multishift_epi64_epi8(_mm512_shuffle_i64x2::<0x02>(t, t), t);
-        let bulk_transition = _mm_cvtsi128_si64(_mm512_castsi512_si128(t)) as u64;
-        let state = scalar_tail.iter().rev().fold(0u32, |state, c| {
-            let class = if *c < 128 { 0 } else { C_LUT[(*c - 128) as usize] };
-            (T_LUT[class as usize] >> (8 * state)) as u32 & 0xff
-        });
-        (bulk_transition >> (8 * state)) & 0xff == 0
+    if data.len() < 16 {
+        return crate::shift_dfa::check_utf8_shift(data);
     }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct i32x16(__m512i);
-impl i32x16 {
-    fn gather<const N: i32>(self, base: *const i32) -> Self {
-        unsafe { Self(_mm512_i32gather_epi32::<N>(self.0, base)) }
-    }
-}
-impl Add for i32x16 {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self::Output {
-        unsafe { Self(_mm512_add_epi32(self.0, rhs.0)) }
-    }
-}
-impl Add<i32> for i32x16 {
-    type Output = Self;
-    fn add(self, rhs: i32) -> Self::Output {
-        unsafe { Self(_mm512_add_epi32(self.0, _mm512_set1_epi32(rhs))) }
-    }
-}
-impl AddAssign for i32x16 {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
-}
-impl AddAssign<i32> for i32x16 {
-    fn add_assign(&mut self, rhs: i32) {
-        *self = *self + rhs
-    }
+    unsafe { check_utf8_kernel(data) }
 }
 
 /// Transpose 16 rows of 8 dwords, given as `r[j]` = rows j (low half) and j+8 (high half):
