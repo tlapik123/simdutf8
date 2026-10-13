@@ -499,16 +499,19 @@ unsafe fn transpose8x8(r: &mut [__m512i; 8]) {
 const REGIONS: usize = 8;
 
 /// Length of the longest prefix of whole 256-byte blocks that is all ASCII.
-fn ascii_prefix_len(data: &[u8]) -> usize {
+///
+/// # Safety
+/// Requires AVX-512 F/BW; the surrounding module is only compiled and called on
+/// machines that have it. Must be `#[target_feature]`, otherwise LLVM lowers the
+/// intrinsics to out-of-line calls.
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn ascii_prefix_len(data: &[u8]) -> usize {
     let (blocks, _) = data.as_chunks::<256>();
     let mut n = 0;
     for block in blocks {
-        let non_ascii = unsafe {
-            let load = |k: usize| _mm512_loadu_epi8(block.as_ptr().add(64 * k) as *const i8);
-            let any = _mm512_or_epi64(_mm512_or_epi64(load(0), load(1)), _mm512_or_epi64(load(2), load(3)));
-            _mm512_movepi8_mask(any) != 0
-        };
-        if non_ascii {
+        let load = |k: usize| _mm512_loadu_epi8(block.as_ptr().add(64 * k) as *const i8);
+        let any = _mm512_or_epi64(_mm512_or_epi64(load(0), load(1)), _mm512_or_epi64(load(2), load(3)));
+        if _mm512_movepi8_mask(any) != 0 {
             break;
         }
         n += 256;
@@ -683,7 +686,7 @@ unsafe fn regions_kernel(data: &[u8], len: usize) -> Option<(u8, u8)> {
 pub fn parallel_automata(data: &[u8]) -> bool {
     // An ASCII prefix cannot affect validity. Scanning it as one sequential stream is
     // faster than skipping it region by region.
-    let data = &data[ascii_prefix_len(data)..];
+    let data = &data[unsafe { ascii_prefix_len(data) }..];
     // Below this the short regions cost more than they gain.
     const MIN_LEN: usize = 16 * 1024;
     if data.len() < MIN_LEN {
