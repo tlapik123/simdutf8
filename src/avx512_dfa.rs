@@ -261,9 +261,8 @@ struct Luts {
     shift1: __m512i,
     /// 0x78 in every byte: the `a` part of a code byte.
     a_mask: __m512i,
-    /// `vpmaddwd` weights folding (pa, pb) into `10 * pa + pb` in byte 1 / byte 2 of each dword.
+    /// `vpmaddwd` weights folding (pa, pb) into `10 * pa + pb` in byte 1 of each dword.
     w1: __m512i,
-    w2: __m512i,
     one: __m512i,
     x80: __m512i,
 }
@@ -278,7 +277,6 @@ impl Luts {
             shift1: _mm512_add_epi8(_mm512_set1_epi8(63), IOTA),
             a_mask: _mm512_set1_epi8(0x78),
             w1: _mm512_set1_epi32(10 | 1 << 16),
-            w2: _mm512_set1_epi32(2560 | 256 << 16),
             one: _mm512_set1_epi8(1),
             x80: _mm512_set1_epi8(0x80u8 as i8),
         }
@@ -354,14 +352,17 @@ unsafe fn group<const N: usize>(l: &Luts, st: &mut Scan, x: [__m512i; N]) -> __m
         // Odd bytes: pairs (2k, 2k+1) -> folded into quads below.
         let pair = _mm512_permutex2var_epi8(l.pair.0, key, l.pair.1);
         st.pair_max = _mm512_max_epu8(st.pair_max, pair);
-        // byte 1 (w1) / byte 2 (w2) of each dword: 10 * pa + pb; the other bytes hold junk
-        let qk = match c {
-            0 => _mm512_srli_epi32::<8>(_mm512_madd_epi16(pair, l.w1)),
-            1 => _mm512_madd_epi16(pair, l.w1),
-            2 => _mm512_madd_epi16(pair, l.w2),
-            _ => _mm512_slli_epi32::<8>(_mm512_madd_epi16(pair, l.w2)),
+        // byte 1 of each dword: 10 * pa + pb; the other bytes hold junk
+        let qk = _mm512_madd_epi16(pair, l.w1);
+        // All four lookups share the byte-1 mask, so it can live in one k register for
+        // the whole loop; the result of chunk c is then shifted into byte c of each dword.
+        let qc = lookup2_maskz(0x2222_2222_2222_2222, l.quad.0, qk, l.quad.1);
+        q[c] = match c {
+            0 => _mm512_srli_epi32::<8>(qc),
+            1 => qc,
+            2 => _mm512_slli_epi32::<8>(qc),
+            _ => _mm512_slli_epi32::<16>(qc),
         };
-        q[c] = lookup2_maskz(0x1111_1111_1111_1111 << c, l.quad.0, qk, l.quad.1);
     }
     match N {
         1 => q[0],
@@ -388,12 +389,12 @@ unsafe fn chain(st: &mut Scan, q: __m512i) {
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
 unsafe fn failed(st: &Scan) -> bool {
+    // Any byte of `chain` with bits 0..2 set is a state mismatch. A pair index of 9 means
+    // a failed pair; odd bytes are additionally folded into quads, whose entries for a
+    // failed pair never chain, so testing every byte is sound and avoids materializing
+    // the 0x5555 mask in a k register (a kmovq costs two uops on the shuffle ports).
     let chain = _mm512_test_epi8_mask(st.chain, _mm512_set1_epi8(7));
-    let pairs = _mm512_mask_cmpeq_epi8_mask(
-        0x5555_5555_5555_5555,
-        st.pair_max,
-        _mm512_set1_epi8(PAIR_FAIL as i8),
-    );
+    let pairs = _mm512_cmpeq_epi8_mask(st.pair_max, _mm512_set1_epi8(PAIR_FAIL as i8));
     (chain | pairs) != 0
 }
 
