@@ -477,28 +477,6 @@ pub fn check_utf8_avx(data: &[u8]) -> bool {
     unsafe { check_utf8_kernel(data) }
 }
 
-/// In-register 8x8 transpose of 64-bit elements: `r[k]` becomes qword `k` of every input row.
-#[inline(always)]
-unsafe fn transpose8x8(r: &mut [__m512i; 8]) {
-    let t: [__m512i; 8] = array::from_fn(|k| {
-        let (a, b) = (r[k & !1], r[k | 1]);
-        if k & 1 == 0 { _mm512_unpacklo_epi64(a, b) } else { _mm512_unpackhi_epi64(a, b) }
-    });
-    // 128-bit blocks (2 qwords of adjacent rows): gather blocks 0,2 resp. 1,3 of pairs.
-    let u: [__m512i; 8] = array::from_fn(|k| {
-        let (a, b) = (t[k & !2], t[k | 2]);
-        if k & 2 == 0 { _mm512_shuffle_i64x2::<0x88>(a, b) } else { _mm512_shuffle_i64x2::<0xdd>(a, b) }
-    });
-    // Stage 2 picked qwords {0,4} (0x88) or {2,6} (0xdd), stage 3 picks +0 or +4.
-    for k in 0..8 {
-        let (a, b) = (u[k & !4], u[k | 4]);
-        r[k] = if k & 4 == 0 { _mm512_shuffle_i64x2::<0x88>(a, b) } else { _mm512_shuffle_i64x2::<0xdd>(a, b) };
-    }
-}
-
-/// Number of regions (one per 64-bit lane) processed in parallel.
-const REGIONS: usize = 8;
-
 /// Length of the longest prefix of whole 256-byte blocks that is all ASCII.
 ///
 /// # Safety
@@ -520,194 +498,24 @@ unsafe fn ascii_prefix_len(data: &[u8]) -> usize {
     n
 }
 
-/// Scalar continuation: `prev` is the code of the last byte seen, `needed` the number of
-/// continuation bytes still outstanding.
-fn finish_scalar(mut prev: u8, mut needed: u8, rest: &[u8]) -> bool {
-    for &x in rest {
-        let code = CODE_LUT[(x.saturating_add(1).saturating_sub(0x80)) as usize];
-        if PAIR_LUT[(prev & 0x78 | code & 7) as usize] == PAIR_FAIL {
-            return false;
-        }
-        needed = match (b_class(code & 7), needed) {
-            (Class::Ascii, 0) => 0,
-            (Class::Cont, n) if n > 0 => n - 1,
-            (Class::Lead2, 0) => 1,
-            (Class::Lead3, 0) => 2,
-            (Class::Lead4, 0) => 3,
-            _ => return false,
-        };
-        prev = code;
-    }
-    needed == 0
-}
-
-/// Per-lane automaton state (lane j runs region j).
-struct Lanes {
-    /// Code bytes of the previous qword (for the pair of the qword's first byte).
-    c_prev: __m512i,
-    /// (s, v) of the previous two quads, `v | s << 4` in bytes 1 and 5 of each qword.
-    q_prev: __m512i,
-}
-
-/// Two quads (one qword) per lane: pair lookups on all eight byte pairs and the quads'
-/// (s, v) in bytes 1 and 5; updates the code history and the pair-failure accumulator.
-#[inline(always)]
-unsafe fn quad_lookup(l: &Luts, st: &mut Scan, la: &mut Lanes, words: __m512i) -> __m512i {
-    let y = _mm512_subs_epu8(_mm512_adds_epu8(words, l.one), l.x80);
-    let code = _mm512_permutex2var_epi8(l.code.0, y, l.code.1);
-    let prev = _mm512_shldi_epi64::<8>(code, la.c_prev);
-    la.c_prev = code;
-    let key = _mm512_ternarylogic_epi32::<0xCA>(l.a_mask, prev, code);
-    let pair = _mm512_permutex2var_epi8(l.pair.0, key, l.pair.1);
-    st.pair_max = _mm512_max_epu8(st.pair_max, pair);
-    let qk = _mm512_madd_epi16(pair, l.w1);
-    lookup2_maskz(0x2222_2222_2222_2222, l.quad.0, qk, l.quad.1)
-}
-
-/// The state `s` required by a quad must be the state `v` yielded by the next one:
-/// quad 0 of this step against quad 1 of the previous step, quad 1 against quad 0.
-#[inline(always)]
-unsafe fn chain_step(st: &mut Scan, la: &mut Lanes, q: __m512i) {
-    let next = _mm512_shldi_epi64::<32>(q, la.q_prev);
-    let s = _mm512_srli_epi64::<4>(next);
-    st.chain = _mm512_ternarylogic_epi32::<0xF6>(st.chain, s, q);
-    la.q_prev = q;
-}
-
-/// Region layout: region r starts at `row[r]`.
-struct Regions {
-    row: [*const u64; REGIONS],
-}
-
-impl Regions {
-    #[inline(always)]
-    unsafe fn load_rows(&self, i: usize) -> [__m512i; 8] {
-        array::from_fn(|j| _mm512_loadu_si512(self.row[j].add(i).cast()))
-    }
-
-    /// Partial block of n <= 8 qwords per region (zero beyond), transposed.
-    #[inline(always)]
-    unsafe fn load_rows_masked(&self, i: usize, n: usize) -> [__m512i; 8] {
-        let m = ((1u32 << n) - 1) as __mmask8;
-        let mut r: [__m512i; 8] =
-            array::from_fn(|j| _mm512_maskz_loadu_epi64(m, self.row[j].add(i).cast()));
-        transpose8x8(&mut r);
-        r
-    }
-}
-
-/// A block of 8 qwords per lane. An all-ASCII block is valid iff no automaton needs
-/// continuation bytes, and leaves every automaton in the initial state.
-#[inline(always)]
-unsafe fn block(l: &Luts, rg: &Regions, st: &mut Scan, la: &mut Lanes, i: usize) {
-    let mut rows = rg.load_rows(i);
-    let any = _mm512_ternarylogic_epi32::<0xFE>(
-        _mm512_ternarylogic_epi32::<0xFE>(rows[0], rows[1], rows[2]),
-        _mm512_ternarylogic_epi32::<0xFE>(rows[3], rows[4], rows[5]),
-        _mm512_or_si512(rows[6], rows[7]),
-    );
-    if _mm512_movepi8_mask(any) == 0
-        && _mm512_test_epi64_mask(la.q_prev, _mm512_set1_epi64(0x7000 << 32)) == 0
-    {
-        la.c_prev = _mm512_setzero_si512();
-        la.q_prev = _mm512_setzero_si512();
-        return;
-    }
-    transpose8x8(&mut rows);
-    for words in rows {
-        let q = quad_lookup(l, st, la, words);
-        chain_step(st, la, q);
-    }
-}
-
-/// Validate the regions; returns the code of the last byte and the number of continuation
-/// bytes outstanding after the last region, or `None` if invalid.
-#[inline(never)]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
-unsafe fn regions_kernel(data: &[u8], len: usize) -> Option<(u8, u8)> {
-    let l = Luts::new();
-    let zero = _mm512_setzero_si512();
-    let mut st = Scan { c_prev: zero, q_prev: zero, pair_max: zero, chain: zero };
-    let base = data.as_ptr() as *const u64;
-    let rg = Regions { row: array::from_fn(|j| base.add(j * len)) };
-
-    // The qword before each region (ASCII before the start) seeds the pair check.
-    let before: [u64; 8] = array::from_fn(|j| if j == 0 { 0 } else { rg.row[j].sub(1).read_unaligned() });
-    let x = _mm512_loadu_si512(before.as_ptr().cast());
-    let y = _mm512_subs_epu8(_mm512_adds_epu8(x, l.one), l.x80);
-    let mut la = Lanes { c_prev: _mm512_permutex2var_epi8(l.code.0, y, l.code.1), q_prev: zero };
-    // First qword of each region: its quad 0 has no predecessor yet (checked at the end),
-    // so pretend the previous step required exactly the state it yields.
-    let words: [u64; 8] = array::from_fn(|j| rg.row[j].read_unaligned());
-    let q_first = quad_lookup(&l, &mut st, &mut la, _mm512_loadu_si512(words.as_ptr().cast()));
-    la.q_prev = _mm512_slli_epi64::<36>(_mm512_and_si512(q_first, _mm512_set1_epi64(0x0700)));
-    chain_step(&mut st, &mut la, q_first);
-
-    let mut i = 1;
-    while i + 8 <= len {
-        block(&l, &rg, &mut st, &mut la, i);
-        i += 8;
-        // Early exit for invalid input, every 4 KiB.
-        if i % 64 == 1 && failed_any(&st) {
-            return None;
-        }
-    }
-    let rem = len - i;
-    if rem > 0 {
-        let rows = rg.load_rows_masked(i, rem);
-        for words in &rows[..rem] {
-            let q = quad_lookup(&l, &mut st, &mut la, *words);
-            chain_step(&mut st, &mut la, q);
-        }
-    }
-    if failed_any(&st) {
-        return None;
-    }
-    // Region boundaries: the state required after region r must be the one yielded by
-    // the first quad of region r + 1.
-    let mut first = [0u64; 8];
-    let mut last = [0u64; 8];
-    let mut codes = [0u64; 8];
-    _mm512_storeu_si512(first.as_mut_ptr().cast(), q_first);
-    _mm512_storeu_si512(last.as_mut_ptr().cast(), la.q_prev);
-    _mm512_storeu_si512(codes.as_mut_ptr().cast(), la.c_prev);
-    let needed = |r: usize| (last[r] >> 44) as u8 & 7;
-    for r in 0..REGIONS - 1 {
-        if needed(r) != (first[r + 1] >> 8) as u8 & 7 {
-            return None;
-        }
-    }
-    Some(((codes[7] >> 56) as u8, needed(7)))
-}
-
-/// 8 parallel automata, each validating one region of the input two quads (one qword)
-/// per step. The regions need no synchronisation: a region's first quad is checked
-/// against the previous region's last one at the end.
+/// UTF-8 validation entry point of this module: skip the ASCII prefix at twice the
+/// kernel's block rate, then run the associative-reduction kernel on the rest.
+///
+/// The kernel's per-byte work is position-local (every lookup is keyed by byte classes
+/// around that position), so there is no serial dependency to hide: running eight
+/// region automata in the lanes of one register only re-arranges which register holds
+/// which bytes, while the 8x8 transpose feeding it costs three shuffle-port uops per
+/// 64 bytes on top of the kernel's four permutes. That made the region layout strictly
+/// slower than the sequential kernel (measured ~25-30% on non-ASCII), so it was removed
+/// in favor of dispatching to the kernel directly.
 #[unsafe(no_mangle)]
 pub fn parallel_automata(data: &[u8]) -> bool {
-    // An ASCII prefix cannot affect validity. Scanning it as one sequential stream is
-    // faster than skipping it region by region.
+    // An ASCII prefix cannot affect validity, and scanning it as whole 256-byte blocks
+    // is faster than validating it block by block.
     let data = &data[unsafe { ascii_prefix_len(data) }..];
-    // Below this the short regions cost more than they gain.
-    const MIN_LEN: usize = 16 * 1024;
-    if data.len() < MIN_LEN {
-        return check_utf8_avx(data);
-    }
-    let len = data.len() / (REGIONS * 8);
-    match unsafe { regions_kernel(data, len) } {
-        Some((prev, needed)) => finish_scalar(prev, needed, &data[len * REGIONS * 8..]),
-        None => false,
-    }
+    check_utf8_avx(data)
 }
 
-/// Like `failed`, for pair indices in every byte.
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
-unsafe fn failed_any(st: &Scan) -> bool {
-    let chain = _mm512_test_epi32_mask(st.chain, _mm512_set1_epi32(0x0700));
-    let pairs = _mm512_cmpeq_epi8_mask(st.pair_max, _mm512_set1_epi8(PAIR_FAIL as i8));
-    chain != 0 || pairs != 0
-}
 
 #[cfg(test)]
 mod tests {
@@ -974,10 +782,10 @@ mod tests {
         }
     }
 
-    /// Errors injected around every region boundary of the parallel automata, plus
-    /// truncations and all-ASCII blocks next to multi-byte characters.
+    /// Errors injected around quad and chunk boundaries, plus truncations and
+    /// all-ASCII blocks next to multi-byte characters.
     #[test]
-    fn parallel_region_boundaries() {
+    fn boundary_corruptions() {
         let text = "aé€😀 ".repeat(2000); // 24 KiB, 12 bytes per repetition
         let mut buf = text.into_bytes();
         buf.extend_from_slice(&[b'a'; 1000]); // all-ASCII blocks at the end
@@ -996,22 +804,6 @@ mod tests {
                 assert_eq!(parallel_automata(&b), str::from_utf8(&b).is_ok(), "pos {pos} byte {bad:#x}");
             }
             assert_eq!(parallel_automata(&buf[..pos]), str::from_utf8(&buf[..pos]).is_ok(), "truncate {pos}");
-        }
-    }
-
-    #[test]
-    fn transpose8x8_works() {
-        unsafe {
-            let mut r: [__m512i; 8] = array::from_fn(|j| {
-                let row: [u64; 8] = array::from_fn(|k| (j * 8 + k) as u64);
-                _mm512_loadu_si512(row.as_ptr().cast())
-            });
-            transpose8x8(&mut r);
-            for k in 0..8 {
-                let mut out = [0u64; 8];
-                _mm512_storeu_si512(out.as_mut_ptr().cast(), r[k]);
-                assert_eq!(out, array::from_fn(|j| (j * 8 + k) as u64), "qword {k}");
-            }
         }
     }
 }
