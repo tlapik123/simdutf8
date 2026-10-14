@@ -511,7 +511,11 @@ unsafe fn ascii_prefix_len(data: &[u8]) -> usize {
 #[unsafe(no_mangle)]
 pub fn parallel_automata(data: &[u8]) -> bool {
     // An ASCII prefix cannot affect validity, and scanning it as whole 256-byte blocks
-    // is faster than validating it block by block.
+    // is faster than validating it block by block. Below one block there is nothing to
+    // skip, and the call is pure overhead on the small-input path.
+    if data.len() < 256 {
+        return check_utf8_avx(data);
+    }
     let data = &data[unsafe { ascii_prefix_len(data) }..];
     check_utf8_avx(data)
 }
